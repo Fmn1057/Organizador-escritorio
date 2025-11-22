@@ -1,0 +1,102 @@
+{
+  "casillas": {
+    "Aplicaciones": [
+      1569,
+      0
+    ],
+    "Carpetas": [
+      1566,
+      410
+    ]
+  },
+  "tamanos": {
+    "Aplicaciones": {
+      "colapsado": [
+        351,
+        50
+      ],
+      "expandido": [
+        351,
+        400
+      ]
+    },
+    "Carpetas": {
+      "colapsado": [
+        351,
+        50
+      ],
+      "expandido": [
+        354,
+        400
+      ]
+    }
+  },
+  "tamanos_iconos": {
+    "Aplicaciones": 40,
+    "Carpetas": 40
+  },
+  "tipos_vista": {
+    "Aplicaciones": "lista",
+    "Carpetas": "lista"
+  },
+  "estados": {
+    "Aplicaciones": true,
+    "Carpetas": false
+  },
+  "panel": [
+    834,
+    -7
+  ],
+  "configuraciones": {
+    "tamano_iconos_defecto": 40,
+    "tamano_colapsado_defecto": [
+      140,
+      50
+    ],
+    "tamano_expandido_defecto": [
+      280,
+      400
+    ],
+    "multiplicador_resolucion_iconos": 3.0,
+    "tipo_vista_defecto": "lista",
+    "velocidad_scroll": 100.0
+  },
+  "colores": {
+    "fondo": [
+      61,
+      199,
+      212,
+      140
+    ],
+    "borde": [
+      39,
+      129,
+      137,
+      220
+    ],
+    "boton_expandir": [
+      45,
+      149,
+      159,
+      200
+    ],
+    "texto": [
+      30,
+      30,
+      30,
+      255
+    ],
+    "lista_fondo": [
+      33,
+      109,
+      116,
+      120
+    ],
+    "lista_borde": [
+      42,
+      139,
+      148,
+      180
+    ]
+  }
+}
