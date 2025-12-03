@@ -1,18 +1,179 @@
+"""
+Organizador de Escritorio - Aplicación para organizar archivos en casillas
+Optimizado y mejorado para mejor rendimiento y estabilidad
+"""
 import sys
 import os
 import shutil
 import json
-import winreg
+import subprocess
+import traceback
+from datetime import datetime
 from pathlib import Path
 from collections import Counter
-from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QLabel, QPushButton, QLineEdit, QMessageBox, QFrame,
-                             QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
-                             QMenu, QColorDialog, QGroupBox, QGridLayout, QScrollBar,
-                             QTabWidget, QSpinBox, QDoubleSpinBox, QSlider, QRadioButton, QButtonGroup)
+from typing import Optional, Tuple, Dict, Any
+
+# PyQt5 imports - organizados y sin duplicados
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
+    QLabel, QPushButton, QLineEdit, QMessageBox, QFrame,
+    QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
+    QMenu, QColorDialog, QGroupBox, QGridLayout, QScrollBar,
+    QTabWidget, QSpinBox, QDoubleSpinBox, QSlider, QRadioButton, 
+    QButtonGroup, QCheckBox, QFileIconProvider
+)
 from PyQt5.QtCore import Qt, QPoint, QMimeData, pyqtSignal, QSettings, QFileInfo, QSize, QTimer, QUrl
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QPainter, QColor, QFont, QImage, QIcon, QWheelEvent, QPixmap, QDrag
-from PyQt5.QtWidgets import QFileIconProvider
+
+# Constantes de configuración
+DEFAULT_ICON_SIZE = 24
+MIN_ICON_SIZE = 16
+MAX_ICON_SIZE = 64
+DEFAULT_RESOLUTION_MULTIPLIER = 2.0
+DEFAULT_SCROLL_SPEED = 100.0
+DEFAULT_COLLAPSED_SIZE = (140, 50)
+DEFAULT_EXPANDED_SIZE = (280, 400)
+MAX_COLLISION_ATTEMPTS = 50
+SNAP_THRESHOLD = 10  # Píxeles de tolerancia para el snap/alineación
+SNAP_THRESHOLD = 10  # Píxeles de tolerancia para el snap/alineación
+
+
+def obtener_icono_desde_url(ruta_archivo):
+    """
+    Intenta obtener el icono de un archivo .url usando múltiples métodos.
+    Los archivos .url pueden tener iconos en IconFile o se pueden obtener desde el shell de Windows.
+    """
+    try:
+        ruta_path = Path(ruta_archivo)
+        if not ruta_path.exists() or ruta_path.suffix.lower() != '.url':
+            return None
+        
+        # Método 1: Intentar usar win32com para obtener el icono del acceso directo .url
+        try:
+            import win32com.client
+            shell = win32com.client.Dispatch("WScript.Shell")
+            shortcut = shell.CreateShortcut(str(ruta_path))
+            
+            # Obtener el icono del acceso directo si tiene uno personalizado
+            if hasattr(shortcut, 'IconLocation') and shortcut.IconLocation:
+                icon_location = shortcut.IconLocation
+                if icon_location:
+                    # IconLocation puede ser "ruta,índice" o solo "ruta"
+                    if ',' in icon_location:
+                        icon_path, icon_index = icon_location.rsplit(',', 1)
+                        try:
+                            icon_index = int(icon_index)
+                        except ValueError:
+                            icon_index = 0
+                    else:
+                        icon_path = icon_location
+                        icon_index = 0
+                    
+                    icon_path = os.path.expandvars(icon_path.strip())
+                    if os.path.exists(icon_path):
+                        # Intentar obtener el icono con el índice específico
+                        file_info = QFileInfo(icon_path)
+                        icon_provider = QFileIconProvider()
+                        icono = icon_provider.icon(file_info)
+                        if icono and not icono.isNull():
+                            # Si hay un índice específico, intentar extraerlo del archivo
+                            if icon_index > 0 and icon_path.lower().endswith(('.exe', '.dll', '.ico')):
+                                # Para archivos con múltiples iconos, Qt debería manejarlo automáticamente
+                                # pero podemos intentar obtener el icono específico
+                                pass
+                            return icono
+            
+            # Si no hay IconLocation, intentar obtener el icono del destino
+            if hasattr(shortcut, 'TargetPath') and shortcut.TargetPath:
+                target_path = os.path.expandvars(shortcut.TargetPath)
+                if os.path.exists(target_path):
+                    file_info = QFileInfo(target_path)
+                    icon_provider = QFileIconProvider()
+                    icono = icon_provider.icon(file_info)
+                    if icono and not icono.isNull():
+                        return icono
+        except ImportError:
+            # win32com no está disponible, continuar con otros métodos
+            pass
+        except Exception:
+            # Error al usar win32com, continuar con otros métodos
+            pass
+        
+        # Método 2: Leer el archivo .url y buscar IconFile manualmente
+        try:
+            with open(ruta_path, 'r', encoding='utf-8', errors='ignore') as f:
+                contenido = f.read()
+            
+            icono_path = None
+            icon_index = 0
+            
+            # Buscar IconFile e IconIndex en el contenido
+            for linea in contenido.split('\n'):
+                linea = linea.strip()
+                if linea.startswith('IconFile='):
+                    icono_path = linea.split('=', 1)[1].strip()
+                elif linea.startswith('IconIndex='):
+                    try:
+                        icon_index = int(linea.split('=', 1)[1].strip())
+                    except ValueError:
+                        icon_index = 0
+                elif linea.startswith('URL='):
+                    url = linea.split('=', 1)[1].strip()
+                    # Si es un juego de Steam, intentar obtener el icono de Steam
+                    if url.startswith('steam://') and not icono_path:
+                        # Buscar steam.exe en ubicaciones comunes
+                        posibles_rutas_steam = [
+                            Path(os.environ.get('ProgramFiles(x86)', '')) / 'Steam' / 'steam.exe',
+                            Path(os.environ.get('ProgramFiles', '')) / 'Steam' / 'steam.exe',
+                            Path.home() / 'AppData' / 'Local' / 'Programs' / 'Steam' / 'steam.exe',
+                            Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'Steam' / 'steam.exe',
+                        ]
+                        for ruta_steam in posibles_rutas_steam:
+                            if ruta_steam.exists():
+                                icono_path = str(ruta_steam)
+                                break
+            
+            # Si encontramos una ruta de icono, intentar obtener el icono
+            if icono_path:
+                icono_path = os.path.expandvars(icono_path)  # Expandir variables de entorno
+                
+                # Manejar rutas con índice (formato "ruta,índice")
+                if ',' in icono_path:
+                    partes = icono_path.rsplit(',', 1)
+                    icono_path = partes[0].strip()
+                    try:
+                        icon_index = int(partes[1].strip())
+                    except ValueError:
+                        icon_index = 0
+                
+                if os.path.exists(icono_path):
+                    file_info = QFileInfo(icono_path)
+                    icon_provider = QFileIconProvider()
+                    icono = icon_provider.icon(file_info)
+                    if icono and not icono.isNull():
+                        return icono
+        except Exception:
+            pass
+        
+        # Método 3: Intentar usar el shell de Windows directamente
+        try:
+            # Usar QFileInfo directamente en el archivo .url
+            # Windows debería resolver automáticamente el icono del acceso directo
+            file_info = QFileInfo(str(ruta_path))
+            icon_provider = QFileIconProvider()
+            icono = icon_provider.icon(file_info)
+            if icono and not icono.isNull():
+                pixmap_test = icono.pixmap(32, 32)
+                if not pixmap_test.isNull() and not pixmap_test.rect().isEmpty():
+                    if pixmap_test.width() > 0 and pixmap_test.height() > 0:
+                        return icono
+        except Exception:
+            pass
+        
+        return None
+    except Exception:
+        # Error silencioso - se usará el método alternativo
+        return None
 
 
 class CasillaVentana(QWidget):
@@ -27,8 +188,8 @@ class CasillaVentana(QWidget):
         self.carpeta_path = Path(carpeta_path) if not isinstance(carpeta_path, Path) else carpeta_path
         self.parent_app = parent_app
         self.expandida = False
-        self.tamano_colapsado = (140, 50)  # Más pequeño y compacto
-        self.tamano_expandido = (280, 400)
+        self.tamano_colapsado = DEFAULT_COLLAPSED_SIZE
+        self.tamano_expandido = DEFAULT_EXPANDED_SIZE
         # Guardar posiciones originales de casillas movidas cuando se expande
         self.posiciones_originales = {}
         # Tamaños personalizados del usuario (colapsado y expandido)
@@ -51,6 +212,8 @@ class CasillaVentana(QWidget):
         self.resize_start_size = None
         self.resize_start_window_pos = None
         self.resize_corner = None
+        # Líneas de guía para alineación
+        self.lineas_guia = []  # Lista de widgets de líneas de guía
         self.setup_ui()
         self.setup_drag_drop()
         
@@ -154,9 +317,23 @@ class CasillaVentana(QWidget):
         """)
         self.label_nombre.setTextFormat(Qt.PlainText)
         
+        # Label indicador de tamaño
+        self.label_tamano = QLabel()
+        self.label_tamano.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.label_tamano.setStyleSheet("""
+            QLabel {
+                color: rgba(200, 200, 200, 180);
+                font-size: 9px;
+                background-color: transparent;
+                padding: 2px 6px;
+                border-radius: 4px;
+            }
+        """)
+        self.actualizar_indicador_tamano()
+        
         barra_superior.addWidget(self.btn_expandir)
         barra_superior.addWidget(self.label_nombre, stretch=1)
-        barra_superior.addStretch()
+        barra_superior.addWidget(self.label_tamano)
         
         # Contador de archivos (con margen izquierdo para alinearse con el título)
         self.contador_layout = QHBoxLayout()
@@ -198,8 +375,8 @@ class CasillaVentana(QWidget):
         self.lista_archivos.setMouseTracking(True)
         # Asegurar que el widget acepte eventos de scroll
         self.lista_archivos.setAttribute(Qt.WA_AcceptTouchEvents, False)
-        # Configurar tamaño inicial de iconos
-        self.actualizar_tamano_iconos()
+        # Configurar tamaño inicial de iconos (sin guardar para evitar sobrescribir valores guardados)
+        self.actualizar_tamano_iconos(guardar=False)
         # Configurar tipo de vista inicial
         self.aplicar_tipo_vista()
         self.lista_archivos.setStyleSheet("""
@@ -307,6 +484,191 @@ class CasillaVentana(QWidget):
         else:
             self.label_nombre.setText(nombre)
             self.label_nombre.setToolTip("")
+    
+    def actualizar_indicador_tamano(self):
+        """Actualiza el indicador de tamaño mostrando ancho x alto"""
+        if hasattr(self, 'label_tamano'):
+            ancho = self.width()
+            alto = self.height()
+            estado = "E" if self.expandida else "C"
+            self.label_tamano.setText(f"{ancho}×{alto} {estado}")
+            self.label_tamano.setToolTip(f"Tamaño actual: {ancho}×{alto} píxeles ({'Expandida' if self.expandida else 'Colapsada'})")
+    
+    def detectar_alineaciones(self, nueva_pos, nuevo_tamano=None):
+        """
+        Detecta si la casilla está cerca de alinearse con otras casillas.
+        Retorna un diccionario con las posiciones de snap sugeridas.
+        """
+        if not self.parent_app:
+            return {}
+        
+        snap_info = {
+            'x': None,  # Posición X sugerida para snap
+            'y': None,  # Posición Y sugerida para snap
+            'ancho': None,  # Ancho sugerido para snap
+            'alto': None,  # Alto sugerido para snap
+            'lineas': []  # Lista de líneas de guía a mostrar
+        }
+        
+        # Obtener dimensiones actuales o propuestas
+        if nuevo_tamano:
+            ancho_actual, alto_actual = nuevo_tamano
+        else:
+            ancho_actual = self.width()
+            alto_actual = self.height()
+        
+        x_actual = nueva_pos.x()
+        y_actual = nueva_pos.y()
+        x_fin_actual = x_actual + ancho_actual
+        y_fin_actual = y_actual + alto_actual
+        
+        # Revisar todas las otras casillas
+        for nombre, otra_casilla in self.parent_app.casillas.items():
+            if otra_casilla == self or not otra_casilla.isVisible():
+                continue
+            
+            otra_x = otra_casilla.pos().x()
+            otra_y = otra_casilla.pos().y()
+            otra_ancho = otra_casilla.width()
+            otra_alto = otra_casilla.height()
+            otra_x_fin = otra_x + otra_ancho
+            otra_y_fin = otra_y + otra_alto
+            
+            # Detectar alineaciones horizontales (bordes izquierdo y derecho)
+            # Borde izquierdo con borde izquierdo
+            diff_izq_izq = abs(x_actual - otra_x)
+            if diff_izq_izq <= SNAP_THRESHOLD:
+                snap_info['x'] = otra_x
+                snap_info['lineas'].append({
+                    'tipo': 'vertical',
+                    'x': otra_x,
+                    'y1': min(y_actual, otra_y),
+                    'y2': max(y_fin_actual, otra_y_fin)
+                })
+            
+            # Borde derecho con borde derecho
+            diff_der_der = abs(x_fin_actual - otra_x_fin)
+            if diff_der_der <= SNAP_THRESHOLD:
+                snap_info['x'] = otra_x_fin - ancho_actual
+                snap_info['lineas'].append({
+                    'tipo': 'vertical',
+                    'x': otra_x_fin,
+                    'y1': min(y_actual, otra_y),
+                    'y2': max(y_fin_actual, otra_y_fin)
+                })
+            
+            # Borde izquierdo con borde derecho (y viceversa)
+            diff_izq_der = abs(x_actual - otra_x_fin)
+            if diff_izq_der <= SNAP_THRESHOLD:
+                snap_info['x'] = otra_x_fin
+                snap_info['lineas'].append({
+                    'tipo': 'vertical',
+                    'x': otra_x_fin,
+                    'y1': min(y_actual, otra_y),
+                    'y2': max(y_fin_actual, otra_y_fin)
+                })
+            
+            diff_der_izq = abs(x_fin_actual - otra_x)
+            if diff_der_izq <= SNAP_THRESHOLD:
+                snap_info['x'] = otra_x - ancho_actual
+                snap_info['lineas'].append({
+                    'tipo': 'vertical',
+                    'x': otra_x,
+                    'y1': min(y_actual, otra_y),
+                    'y2': max(y_fin_actual, otra_y_fin)
+                })
+            
+            # Detectar alineaciones verticales (bordes superior e inferior)
+            # Borde superior con borde superior
+            diff_sup_sup = abs(y_actual - otra_y)
+            if diff_sup_sup <= SNAP_THRESHOLD:
+                snap_info['y'] = otra_y
+                snap_info['lineas'].append({
+                    'tipo': 'horizontal',
+                    'y': otra_y,
+                    'x1': min(x_actual, otra_x),
+                    'x2': max(x_fin_actual, otra_x_fin)
+                })
+            
+            # Borde inferior con borde inferior
+            diff_inf_inf = abs(y_fin_actual - otra_y_fin)
+            if diff_inf_inf <= SNAP_THRESHOLD:
+                snap_info['y'] = otra_y_fin - alto_actual
+                snap_info['lineas'].append({
+                    'tipo': 'horizontal',
+                    'y': otra_y_fin,
+                    'x1': min(x_actual, otra_x),
+                    'x2': max(x_fin_actual, otra_x_fin)
+                })
+            
+            # Borde superior con borde inferior (y viceversa)
+            diff_sup_inf = abs(y_actual - otra_y_fin)
+            if diff_sup_inf <= SNAP_THRESHOLD:
+                snap_info['y'] = otra_y_fin
+                snap_info['lineas'].append({
+                    'tipo': 'horizontal',
+                    'y': otra_y_fin,
+                    'x1': min(x_actual, otra_x),
+                    'x2': max(x_fin_actual, otra_x_fin)
+                })
+            
+            diff_inf_sup = abs(y_fin_actual - otra_y)
+            if diff_inf_sup <= SNAP_THRESHOLD:
+                snap_info['y'] = otra_y - alto_actual
+                snap_info['lineas'].append({
+                    'tipo': 'horizontal',
+                    'y': otra_y,
+                    'x1': min(x_actual, otra_x),
+                    'x2': max(x_fin_actual, otra_x_fin)
+                })
+            
+            # Detectar tamaños similares (para unificar tamaños)
+            diff_ancho = abs(ancho_actual - otra_ancho)
+            if diff_ancho <= SNAP_THRESHOLD and nuevo_tamano:
+                snap_info['ancho'] = otra_ancho
+            
+            diff_alto = abs(alto_actual - otra_alto)
+            if diff_alto <= SNAP_THRESHOLD and nuevo_tamano:
+                snap_info['alto'] = otra_alto
+        
+        return snap_info
+    
+    def mostrar_lineas_guia(self, lineas):
+        """Muestra las líneas de guía visuales"""
+        # Limpiar líneas anteriores
+        self.ocultar_lineas_guia()
+        
+        if not self.parent_app:
+            return
+        
+        # Obtener la ventana principal (desktop)
+        desktop = QApplication.desktop()
+        screen = desktop.screenGeometry()
+        
+        for linea_info in lineas:
+            # Crear widget de línea de guía
+            linea = QWidget()
+            linea.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+            linea.setAttribute(Qt.WA_TranslucentBackground)
+            
+            if linea_info['tipo'] == 'vertical':
+                # Línea vertical
+                linea.setGeometry(linea_info['x'], linea_info['y1'], 2, linea_info['y2'] - linea_info['y1'])
+                linea.setStyleSheet("background-color: rgba(255, 100, 100, 200);")
+            else:
+                # Línea horizontal
+                linea.setGeometry(linea_info['x1'], linea_info['y'], linea_info['x2'] - linea_info['x1'], 2)
+                linea.setStyleSheet("background-color: rgba(255, 100, 100, 200);")
+            
+            linea.show()
+            self.lineas_guia.append(linea)
+    
+    def ocultar_lineas_guia(self):
+        """Oculta todas las líneas de guía"""
+        for linea in self.lineas_guia:
+            linea.hide()
+            linea.deleteLater()
+        self.lineas_guia.clear()
         
     def setup_drag_drop(self):
         """Configura el arrastre y soltado de archivos"""
@@ -535,6 +897,35 @@ class CasillaVentana(QWidget):
                     nuevo_alto = 40
                     nueva_y = self.resize_start_window_pos.y() + (self.resize_start_size.y() - 40)
             
+            # Detectar alineaciones y aplicar snap al tamaño
+            nueva_pos_temp = QPoint(nueva_x, nueva_y)
+            snap_info = self.detectar_alineaciones(nueva_pos_temp, (nuevo_ancho, nuevo_alto))
+            
+            # Aplicar snap al tamaño si está cerca de otro tamaño
+            if snap_info['ancho'] is not None:
+                # Ajustar posición X si se redimensiona desde la izquierda
+                if self.resize_corner in ['borde_izquierdo', 'esquina_inferior_izquierda', 'esquina_superior_izquierda']:
+                    nueva_x = nueva_x - (snap_info['ancho'] - nuevo_ancho)
+                nuevo_ancho = snap_info['ancho']
+            
+            if snap_info['alto'] is not None:
+                # Ajustar posición Y si se redimensiona desde arriba
+                if self.resize_corner in ['borde_superior', 'esquina_superior_derecha', 'esquina_superior_izquierda']:
+                    nueva_y = nueva_y - (snap_info['alto'] - nuevo_alto)
+                nuevo_alto = snap_info['alto']
+            
+            # Aplicar snap a la posición
+            if snap_info['x'] is not None:
+                nueva_x = snap_info['x']
+            if snap_info['y'] is not None:
+                nueva_y = snap_info['y']
+            
+            # Mostrar líneas de guía
+            if snap_info['lineas']:
+                self.mostrar_lineas_guia(snap_info['lineas'])
+            else:
+                self.ocultar_lineas_guia()
+            
             # Aplicar cambios
             self.resize(nuevo_ancho, nuevo_alto)
             if self.resize_corner in ['borde_izquierdo', 'borde_superior', 'esquina_inferior_izquierda', 
@@ -543,6 +934,8 @@ class CasillaVentana(QWidget):
             
             # Actualizar título para que se ajuste al nuevo tamaño
             self.actualizar_titulo()
+            # Actualizar indicador de tamaño
+            self.actualizar_indicador_tamano()
             
             # Guardar tamaño personalizado según el estado
             if self.expandida:
@@ -557,6 +950,20 @@ class CasillaVentana(QWidget):
             nueva_pos = self.pos() + delta
             # Limitar la posición dentro de los bordes de la pantalla
             nueva_pos = self.limitar_a_pantalla(nueva_pos)
+            
+            # Detectar alineaciones y aplicar snap
+            snap_info = self.detectar_alineaciones(nueva_pos)
+            if snap_info['x'] is not None:
+                nueva_pos.setX(snap_info['x'])
+            if snap_info['y'] is not None:
+                nueva_pos.setY(snap_info['y'])
+            
+            # Mostrar líneas de guía
+            if snap_info['lineas']:
+                self.mostrar_lineas_guia(snap_info['lineas'])
+            else:
+                self.ocultar_lineas_guia()
+            
             # Evitar colisiones con otras casillas
             nueva_pos = self.evitar_colisiones(nueva_pos)
             self.move(nueva_pos)
@@ -579,15 +986,16 @@ class CasillaVentana(QWidget):
             else:
                 self.setCursor(Qt.ArrowCursor)
     
-    def actualizar_tamano_iconos(self):
+    def actualizar_tamano_iconos(self, guardar=True):
         """Actualiza el tamaño de los iconos en la lista"""
         self.lista_archivos.setIconSize(QSize(self.tamano_iconos, self.tamano_iconos))
         # Si está en modo cuadrícula, actualizar el tamaño de la cuadrícula
         if self.tipo_vista == "cuadricula":
             tamano_cuadricula = max(self.tamano_iconos + 80, 120)
             self.lista_archivos.setGridSize(QSize(tamano_cuadricula, tamano_cuadricula))
-        # Guardar el tamaño de iconos si hay una app padre
-        if self.parent_app:
+        # Guardar el tamaño de iconos si hay una app padre y se solicita guardar
+        # No guardar durante la inicialización para evitar sobrescribir valores guardados
+        if self.parent_app and guardar:
             self.parent_app.guardar_tamano_iconos(self.nombre, self.tamano_iconos)
     
     def actualizar_velocidad_scroll(self):
@@ -601,16 +1009,16 @@ class CasillaVentana(QWidget):
     
     def calcular_porcentaje_iconos(self, tamano):
         """Calcula el porcentaje del tamaño de iconos (16px = 0%, 64px = 100%)"""
-        rango_min = 16
-        rango_max = 64
+        rango_min = MIN_ICON_SIZE
+        rango_max = MAX_ICON_SIZE
         rango_total = rango_max - rango_min
         porcentaje = ((tamano - rango_min) / rango_total) * 100
         return round(porcentaje, 1)
     
     def cambiar_tamano_iconos_porcentaje(self, incremento_porcentaje):
         """Cambia el tamaño de los iconos en porcentaje (positivo para aumentar, negativo para disminuir)"""
-        rango_min = 16
-        rango_max = 64
+        rango_min = MIN_ICON_SIZE
+        rango_max = MAX_ICON_SIZE
         rango_total = rango_max - rango_min
         
         # Calcular porcentaje actual
@@ -791,7 +1199,7 @@ class CasillaVentana(QWidget):
         
         nueva_pos = QPoint(posicion.x(), posicion.y())
         intentos = 0
-        max_intentos = 50
+        max_intentos = MAX_COLLISION_ATTEMPTS
         
         # Intentar encontrar una posición sin colisiones
         while intentos < max_intentos:
@@ -868,6 +1276,8 @@ class CasillaVentana(QWidget):
         self.resize_start_window_pos = None
         self.resize_corner = None
         self.setCursor(Qt.ArrowCursor)
+        # Ocultar líneas de guía al soltar
+        self.ocultar_lineas_guia()
         
     def dragLeaveEvent(self, event):
         """Se ejecuta cuando se sale del área de la casilla"""
@@ -891,43 +1301,72 @@ class CasillaVentana(QWidget):
         
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
+            archivos_procesados = False
+            
             for url in urls:
                 archivo_path = url.toLocalFile()
-                if os.path.exists(archivo_path):
+                
+                if not archivo_path or not os.path.exists(archivo_path):
+                    continue
+                
+                try:
                     elemento = Path(archivo_path)
                     
+                    # Normalizar las rutas para comparación
+                    carpeta_path_normalizado = Path(self.carpeta_path).resolve()
+                    elemento_parent_normalizado = Path(elemento.parent).resolve()
+                    
                     # Verificar si el archivo viene de esta misma casilla (no mover)
-                    if elemento.parent == self.carpeta_path:
-                        # El archivo ya está en esta casilla, no hacer nada
-                        event.ignore()
-                        return
+                    if elemento_parent_normalizado == carpeta_path_normalizado:
+                        # El archivo ya está en esta casilla, continuar con el siguiente
+                        continue
                     
                     # Verificar si viene de otra casilla
+                    casilla_origen = None
                     if self.parent_app:
                         # Buscar en qué casilla está el archivo
-                        casilla_origen = None
                         for nombre, casilla in self.parent_app.casillas.items():
-                            if elemento.parent == casilla.carpeta_path:
-                                casilla_origen = casilla
-                                break
-                        
-                        # Si viene de otra casilla, mover entre casillas
-                        if casilla_origen and casilla_origen != self:
-                            self.parent_app.mover_archivo_entre_casillas(archivo_path, casilla_origen.nombre, self.nombre)
-                        else:
-                            # Viene del escritorio u otra ubicación, mover a esta casilla
-                            self.archivo_soltado.emit(archivo_path, self.nombre)
+                            try:
+                                casilla_path_normalizado = Path(casilla.carpeta_path).resolve()
+                                if elemento_parent_normalizado == casilla_path_normalizado:
+                                    casilla_origen = casilla
+                                    break
+                            except Exception:
+                                continue
+                    
+                    # Si viene de otra casilla, mover entre casillas
+                    if casilla_origen and casilla_origen != self:
+                        self.parent_app.mover_archivo_entre_casillas(archivo_path, casilla_origen.nombre, self.nombre)
+                        archivos_procesados = True
+                    else:
+                        # Viene del escritorio u otra ubicación, mover a esta casilla
+                        self.archivo_soltado.emit(archivo_path, self.nombre)
+                        archivos_procesados = True
+                except Exception as e:
+                    # Error silencioso - el archivo simplemente no se moverá
+                    continue
             
-            # Actualizar lista después de mover archivo
-            self.actualizar_lista_archivos()
-            event.acceptProposedAction()
+            # Actualizar lista después de mover archivo si se procesó alguno
+            if archivos_procesados:
+                self.actualizar_lista_archivos()
+                # Aceptar la acción (puede ser CopyAction o MoveAction dependiendo del origen)
+                event.acceptProposedAction()
+                event.accept()
+            else:
+                event.ignore()
         else:
             event.ignore()
     
     def dragEnterEvent(self, event: QDragEnterEvent):
         """Se ejecuta cuando se arrastra algo sobre la casilla"""
         if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+            # Windows bloquea MoveAction desde el escritorio, así que siempre aceptamos CopyAction
+            # Luego moveremos manualmente en el dropEvent (no copiamos, movemos)
+            # Siempre usar CopyAction para evitar el símbolo de bloqueo
+            # El movimiento real se hace manualmente en dropEvent
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+            
             self.frame.setStyleSheet("""
                 QFrame {
                     background-color: rgba(120, 180, 230, 200);
@@ -935,6 +1374,16 @@ class CasillaVentana(QWidget):
                     border-radius: 12px;
                 }
             """)
+        else:
+            event.ignore()
+    
+    def dragMoveEvent(self, event: QDragEnterEvent):
+        """Se ejecuta cuando se mueve el arrastre sobre la casilla"""
+        if event.mimeData().hasUrls():
+            # Siempre usar CopyAction para evitar el símbolo de bloqueo
+            # El movimiento real se hace manualmente en dropEvent
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
         else:
             event.ignore()
     
@@ -971,6 +1420,8 @@ class CasillaVentana(QWidget):
             
             # Actualizar título
             self.actualizar_titulo()
+            # Actualizar indicador de tamaño
+            self.actualizar_indicador_tamano()
             
             # Forzar actualización del layout antes de mover casillas
             QApplication.processEvents()
@@ -996,6 +1447,11 @@ class CasillaVentana(QWidget):
             self.lista_archivos.setMinimumHeight(0)
             self.lista_archivos.setMaximumHeight(0)
             self.lista_archivos.setVisible(False)
+            
+            # Actualizar título
+            self.actualizar_titulo()
+            # Actualizar indicador de tamaño
+            self.actualizar_indicador_tamano()
             self.btn_expandir.setText("▼")
             
             # Ocultar contador cuando está colapsada
@@ -1153,7 +1609,7 @@ class CasillaVentana(QWidget):
         
         nueva_pos = QPoint(posicion.x(), posicion.y())
         intentos = 0
-        max_intentos = 50
+        max_intentos = MAX_COLLISION_ATTEMPTS
         
         while intentos < max_intentos:
             colision = False
@@ -1204,8 +1660,12 @@ class CasillaVentana(QWidget):
             for item in carpeta.iterdir():
                 # Incluir tanto archivos como carpetas
                 elementos.append(item)
-        except Exception as e:
+        except (OSError, PermissionError) as e:
             print(f"Error al leer elementos de {carpeta}: {e}")
+            self.label_contador.setText("Error de acceso")
+            return
+        except Exception as e:
+            print(f"Error inesperado al leer elementos de {carpeta}: {e}")
             self.label_contador.setText("Error")
             return
         
@@ -1222,49 +1682,148 @@ class CasillaVentana(QWidget):
         # Tamaño deseado para los iconos (usar un tamaño mayor para mejor calidad al escalar)
         tamano_icono_deseado = QSize(self.tamano_iconos, self.tamano_iconos)
         # Obtener el icono en un tamaño mayor para mejor calidad (usar multiplicador configurado)
-        multiplicador = getattr(self, 'multiplicador_resolucion_iconos', 2.0)
+        multiplicador = getattr(self, 'multiplicador_resolucion_iconos', DEFAULT_RESOLUTION_MULTIPLIER)
         tamano_icono_alta_calidad = QSize(
             int(self.tamano_iconos * multiplicador), 
             int(self.tamano_iconos * multiplicador)
         )
+        
+        # Función auxiliar para obtener icono con fallbacks
+        def obtener_icono_mejorado(ruta_archivo, es_carpeta=False):
+            """Obtiene el icono de un archivo con múltiples fallbacks"""
+            icono = None
+            file_info = QFileInfo(ruta_archivo)
+            
+            # Método 1: Para archivos .url, usar método especializado PRIMERO (prioridad alta)
+            if not es_carpeta:
+                try:
+                    suffix = Path(ruta_archivo).suffix.lower()
+                    if suffix == '.url':
+                        # Intentar obtener icono desde el contenido del archivo .url
+                        icono_url = obtener_icono_desde_url(ruta_archivo)
+                        if icono_url and not icono_url.isNull():
+                            pixmap_test = icono_url.pixmap(tamano_icono_alta_calidad)
+                            if not pixmap_test.isNull() and not pixmap_test.rect().isEmpty():
+                                if pixmap_test.width() > 0 and pixmap_test.height() > 0:
+                                    return icono_url
+                except Exception:
+                    pass
+            
+            # Método 2: Intentar obtener icono del sistema usando QFileIconProvider
+            try:
+                if es_carpeta:
+                    icono = icon_provider.icon(QFileIconProvider.Folder)
+                else:
+                    icono = icon_provider.icon(file_info)
+                
+                # Verificar que el icono sea válido (no esté vacío)
+                if icono and not icono.isNull():
+                    pixmap_test = icono.pixmap(tamano_icono_alta_calidad)
+                    if not pixmap_test.isNull() and not pixmap_test.rect().isEmpty():
+                        # Verificar que el pixmap tenga contenido real (no solo transparente)
+                        if pixmap_test.width() > 0 and pixmap_test.height() > 0:
+                            return icono
+            except Exception:
+                pass
+            
+            # Método 2b: Para archivos ejecutables y accesos directos, intentar múltiples veces
+            if not es_carpeta:
+                try:
+                    suffix = Path(ruta_archivo).suffix.lower()
+                    # Para ejecutables, intentar obtener el icono con diferentes métodos
+                    if suffix in ['.exe', '.lnk', '.ink', '.msi', '.bat', '.cmd']:
+                        # Intentar con el archivo directamente
+                        icono = icon_provider.icon(file_info)
+                        if icono and not icono.isNull():
+                            pixmap_test = icono.pixmap(tamano_icono_alta_calidad)
+                            if not pixmap_test.isNull() and not pixmap_test.rect().isEmpty():
+                                # Verificar que tenga contenido real
+                                if pixmap_test.width() > 0 and pixmap_test.height() > 0:
+                                    return icono
+                        
+                        # Si es un acceso directo (.lnk), intentar obtener el icono del destino
+                        if suffix == '.lnk':
+                            try:
+                                # QFileInfo debería resolver el destino del acceso directo
+                                icono = icon_provider.icon(file_info)
+                                if icono and not icono.isNull():
+                                    pixmap_test = icono.pixmap(tamano_icono_alta_calidad)
+                                    if not pixmap_test.isNull() and not pixmap_test.rect().isEmpty():
+                                        return icono
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                
+                # Método 3: Intentar obtener icono del tipo de archivo específico
+                try:
+                    icono = icon_provider.icon(file_info)
+                    if icono and not icono.isNull():
+                        pixmap_test = icono.pixmap(tamano_icono_alta_calidad)
+                        if not pixmap_test.isNull() and not pixmap_test.rect().isEmpty():
+                            return icono
+                except Exception:
+                    pass
+                
+                # Método 4: Intentar usar el icono del tipo de archivo genérico
+                try:
+                    icono = icon_provider.icon(QFileIconProvider.File)
+                    if icono and not icono.isNull():
+                        pixmap_test = icono.pixmap(tamano_icono_alta_calidad)
+                        if not pixmap_test.isNull() and not pixmap_test.rect().isEmpty():
+                            return icono
+                except Exception:
+                    pass
+            
+            # Método 5: Fallback final - icono genérico
+            if es_carpeta:
+                return icon_provider.icon(QFileIconProvider.Folder)
+            else:
+                return icon_provider.icon(QFileIconProvider.File)
         
         # Agregar a la lista con iconos reales
         for elemento in elementos_ordenados:
             if elemento.is_dir():
                 # Carpeta: usar icono de carpeta
                 nombre = elemento.name
-                file_info = QFileInfo(str(elemento))
-                icono_original = icon_provider.icon(file_info)
+                icono_original = obtener_icono_mejorado(str(elemento), es_carpeta=True)
             else:
                 # Archivo: obtener icono según el tipo
                 nombre = elemento.name
                 ruta_archivo = str(elemento)
-                
-                # Para archivos .lnk, .url, .ink (atajos), intentar obtener el icono del destino
-                if elemento.suffix.lower() in ['lnk', 'url', 'ink']:
-                    try:
-                        # Intentar obtener el icono del archivo destino
-                        file_info = QFileInfo(ruta_archivo)
-                        icono_original = icon_provider.icon(file_info)
-                    except:
-                        # Si falla, usar icono genérico
-                        file_info = QFileInfo(ruta_archivo)
-                        icono_original = icon_provider.icon(QFileIconProvider.File)
-                else:
-                    # Para otros archivos, usar el icono del sistema
-                    file_info = QFileInfo(ruta_archivo)
-                    icono_original = icon_provider.icon(file_info)
+                icono_original = obtener_icono_mejorado(ruta_archivo, es_carpeta=False)
             
             # Obtener el pixmap en alta calidad y escalarlo suavemente
-            pixmap_alta_calidad = icono_original.pixmap(tamano_icono_alta_calidad)
-            # Escalar suavemente al tamaño deseado para mejor calidad
-            pixmap_final = pixmap_alta_calidad.scaled(
-                tamano_icono_deseado,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-            # Crear un nuevo icono con el pixmap de alta calidad
-            icono_mejorado = QIcon(pixmap_final)
+            try:
+                pixmap_alta_calidad = icono_original.pixmap(tamano_icono_alta_calidad)
+                
+                # Verificar que el pixmap sea válido
+                if pixmap_alta_calidad.isNull() or pixmap_alta_calidad.rect().isEmpty():
+                    # Si el pixmap está vacío, crear uno por defecto
+                    pixmap_alta_calidad = QPixmap(tamano_icono_alta_calidad)
+                    pixmap_alta_calidad.fill(QColor(200, 200, 200))  # Gris claro como fallback
+                
+                # Escalar suavemente al tamaño deseado para mejor calidad
+                pixmap_final = pixmap_alta_calidad.scaled(
+                    tamano_icono_deseado,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+                
+                # Verificar que el pixmap final sea válido
+                if pixmap_final.isNull() or pixmap_final.rect().isEmpty():
+                    # Crear un pixmap por defecto
+                    pixmap_final = QPixmap(tamano_icono_deseado)
+                    pixmap_final.fill(QColor(200, 200, 200))
+                
+                # Crear un nuevo icono con el pixmap de alta calidad
+                icono_mejorado = QIcon(pixmap_final)
+            except Exception as e:
+                # Si todo falla, crear un icono genérico
+                print(f"Error al procesar icono para {nombre}: {e}")
+                pixmap_fallback = QPixmap(tamano_icono_deseado)
+                pixmap_fallback.fill(QColor(200, 200, 200))
+                icono_mejorado = QIcon(pixmap_fallback)
             
             item = QListWidgetItem(icono_mejorado, nombre)
             item.setData(Qt.UserRole, str(elemento))
@@ -1384,8 +1943,10 @@ class CasillaVentana(QWidget):
                 else:
                     # Abrir archivo
                     os.startfile(ruta_elemento)  # Windows
+            except (OSError, PermissionError, FileNotFoundError) as e:
+                QMessageBox.warning(self, "Error", f"No se pudo abrir el archivo:\n{str(e)}")
             except Exception as e:
-                QMessageBox.warning(self, "Error", f"No se pudo abrir: {str(e)}")
+                QMessageBox.warning(self, "Error", f"Error inesperado al abrir:\n{str(e)}")
             
     def eliminar_casilla(self):
         """Elimina la casilla"""
@@ -1508,20 +2069,120 @@ def obtener_ruta_fondo_escritorio():
             winreg.HKEY_CURRENT_USER,
             r"Control Panel\Desktop"
         )
+        
+        # Método 1: Intentar obtener "Wallpaper" (método tradicional)
         try:
-            # Obtener el valor del fondo
             wallpaper_path, _ = winreg.QueryValueEx(key, "Wallpaper")
-            winreg.CloseKey(key)
+            wallpaper_path = os.path.expandvars(wallpaper_path)
+            if wallpaper_path and os.path.exists(wallpaper_path):
+                winreg.CloseKey(key)
+                return wallpaper_path
+        except (OSError, FileNotFoundError, ValueError):
+            pass
+        
+        # Método 2: Intentar obtener "TranscodedWallpaper" (Windows 10/11)
+        try:
+            transcoded_path, _ = winreg.QueryValueEx(key, "TranscodedWallpaper")
+            transcoded_path = os.path.expandvars(transcoded_path)
+            if transcoded_path and os.path.exists(transcoded_path):
+                winreg.CloseKey(key)
+                return transcoded_path
             
-            # Expandir variables de entorno si es necesario
+            # Si TranscodedWallpaper existe pero la ruta no, buscar en ubicaciones comunes
+            if transcoded_path:
+                nombre_archivo = os.path.basename(transcoded_path)
+                # Buscar en Themes
+                temas_path = Path(os.environ.get('APPDATA', '')) / "Microsoft" / "Windows" / "Themes"
+                transcoded_file = temas_path / nombre_archivo
+                if transcoded_file.exists():
+                    winreg.CloseKey(key)
+                    return str(transcoded_file)
+                # Buscar el archivo TranscodedWallpaper directamente
+                transcoded_wallpaper = temas_path / "TranscodedWallpaper"
+                if transcoded_wallpaper.exists():
+                    winreg.CloseKey(key)
+                    return str(transcoded_wallpaper)
+        except (OSError, FileNotFoundError, ValueError):
+            pass
+        
+        # Método 3: Si Wallpaper existe pero la ruta no, buscar en ubicaciones alternativas
+        try:
+            wallpaper_path, _ = winreg.QueryValueEx(key, "Wallpaper")
             wallpaper_path = os.path.expandvars(wallpaper_path)
             
-            if os.path.exists(wallpaper_path):
-                return wallpaper_path
-        except:
-            winreg.CloseKey(key)
+            if wallpaper_path:
+                # Extraer solo el nombre del archivo
+                nombre_archivo = os.path.basename(wallpaper_path)
+                
+                # Buscar en AppData\Roaming\Microsoft\Windows\Themes
+                appdata_path = Path(os.environ.get('APPDATA', '')) / "Microsoft" / "Windows" / "Themes" / nombre_archivo
+                if appdata_path.exists():
+                    winreg.CloseKey(key)
+                    return str(appdata_path)
+                
+                # Buscar en la carpeta de Windows
+                windows_path = Path(os.environ.get('WINDIR', '')) / "Web" / "Wallpaper" / nombre_archivo
+                if windows_path.exists():
+                    winreg.CloseKey(key)
+                    return str(windows_path)
+                
+                # Buscar en subcarpetas de Windows\Web\Wallpaper
+                wallpaper_base = Path(os.environ.get('WINDIR', '')) / "Web" / "Wallpaper"
+                if wallpaper_base.exists():
+                    for subfolder in wallpaper_base.iterdir():
+                        if subfolder.is_dir():
+                            potential_path = subfolder / nombre_archivo
+                            if potential_path.exists():
+                                winreg.CloseKey(key)
+                                return str(potential_path)
+        except (OSError, FileNotFoundError, ValueError):
+            pass
+        
+        winreg.CloseKey(key)
+        
+    except (OSError, FileNotFoundError, PermissionError):
+        # Si no se puede acceder al registro, intentar métodos alternativos
+        pass
+    except Exception:
+        pass
+    
+    # Método 4: Buscar directamente en la carpeta de temas de Windows
+    try:
+        temas_path = Path(os.environ.get('APPDATA', '')) / "Microsoft" / "Windows" / "Themes"
+        if temas_path.exists():
+            # Buscar TranscodedWallpaper primero (más común en Windows 10/11)
+            transcoded_wallpaper = temas_path / "TranscodedWallpaper"
+            if transcoded_wallpaper.exists() and transcoded_wallpaper.is_file():
+                return str(transcoded_wallpaper)
+            
+            # Buscar archivos de imagen comunes
+            extensiones = ['.jpg', '.jpeg', '.png', '.bmp', '.jfif']
+            for ext in extensiones:
+                for archivo in temas_path.glob(f'*{ext}'):
+                    if archivo.is_file() and archivo.stat().st_size > 0:  # Verificar que no esté vacío
+                        return str(archivo)
+    except Exception:
+        pass
+    
+    # Método 5: Buscar en las carpetas de fondos de Windows
+    try:
+        wallpaper_base = Path(os.environ.get('WINDIR', '')) / "Web" / "Wallpaper"
+        if wallpaper_base.exists():
+            # Buscar en subcarpetas
+            for subfolder in wallpaper_base.iterdir():
+                if subfolder.is_dir():
+                    extensiones = ['.jpg', '.jpeg', '.png', '.bmp', '.jfif']
+                    for ext in extensiones:
+                        for archivo in subfolder.glob(f'*{ext}'):
+                            if archivo.is_file() and archivo.stat().st_size > 0:
+                                return str(archivo)
+    except Exception:
+        pass
+        
+    except (OSError, FileNotFoundError, PermissionError) as e:
+        print(f"Error al acceder al registro de Windows: {e}")
     except Exception as e:
-        print(f"Error al obtener fondo de escritorio: {e}")
+        print(f"Error inesperado al obtener fondo de escritorio: {e}")
     
     return None
 
@@ -1819,8 +2480,13 @@ class DialogConfigurarColores(QDialog):
             QMessageBox.warning(
                 self, 
                 "No se pudo detectar", 
-                "No se pudo obtener la ruta del fondo de escritorio.\n"
-                "Asegúrate de tener un fondo de escritorio configurado."
+                "No se pudo obtener la ruta del fondo de escritorio.\n\n"
+                "Posibles causas:\n"
+                "• Tienes un fondo de color sólido (no una imagen)\n"
+                "• Tienes una presentación de diapositivas activa\n"
+                "• El archivo del fondo no existe o fue movido\n\n"
+                "Solución: Configura una imagen como fondo de escritorio\n"
+                "y vuelve a intentar."
             )
             return
         
@@ -2336,10 +3002,59 @@ class DialogConfiguracionesAvanzadas(QDialog):
         layout_vistas.addStretch()
         tab_vistas.setLayout(layout_vistas)
         
+        # Pestaña 5: Inicio Automático
+        tab_inicio = QWidget()
+        layout_inicio = QVBoxLayout()
+        layout_inicio.setSpacing(15)
+        
+        grupo_inicio = QGroupBox("Inicio Automático con Windows")
+        grupo_inicio.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid rgba(100, 150, 200, 180);
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+        """)
+        layout_grupo_inicio = QVBoxLayout()
+        layout_grupo_inicio.setSpacing(10)
+        
+        # Checkbox para activar/desactivar inicio automático
+        self.checkbox_inicio = QCheckBox("Ejecutar al iniciar Windows")
+        self.checkbox_inicio.setStyleSheet("""
+            QCheckBox {
+                font-size: 12px;
+                padding: 5px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+            }
+        """)
+        self.checkbox_inicio.stateChanged.connect(self.cambiar_inicio_automatico)
+        
+        label_info_inicio = QLabel(
+            "Cuando esta opción está activada, el Organizador de Escritorio se ejecutará automáticamente cada vez que inicies Windows.\n\n"
+            "Puedes activar o desactivar esta opción en cualquier momento."
+        )
+        label_info_inicio.setWordWrap(True)
+        label_info_inicio.setStyleSheet("color: #666; font-size: 10px;")
+        
+        layout_grupo_inicio.addWidget(self.checkbox_inicio)
+        layout_grupo_inicio.addWidget(label_info_inicio)
+        layout_grupo_inicio.addStretch()
+        grupo_inicio.setLayout(layout_grupo_inicio)
+        
+        layout_inicio.addWidget(grupo_inicio)
+        layout_inicio.addStretch()
+        tab_inicio.setLayout(layout_inicio)
+        
         tabs.addTab(tab_colores, "🎨 Colores")
         tabs.addTab(tab_tamanos, "📏 Tamaños")
         tabs.addTab(tab_scroll, "🖱️ Desplazamiento")
         tabs.addTab(tab_vistas, "👁️ Vistas")
+        tabs.addTab(tab_inicio, "🚀 Inicio")
         
         layout_principal.addWidget(tabs)
         
@@ -2353,8 +3068,8 @@ class DialogConfiguracionesAvanzadas(QDialog):
     
     def calcular_porcentaje_iconos(self, tamano):
         """Calcula el porcentaje del tamaño de iconos (16px = 0%, 64px = 100%)"""
-        rango_min = 16
-        rango_max = 64
+        rango_min = MIN_ICON_SIZE
+        rango_max = MAX_ICON_SIZE
         rango_total = rango_max - rango_min
         porcentaje = ((tamano - rango_min) / rango_total) * 100
         return round(porcentaje, 1)
@@ -2462,8 +3177,45 @@ class DialogConfiguracionesAvanzadas(QDialog):
         if dialog.exec_() == QDialog.Accepted:
             self.parent_app.aplicar_colores(dialog.colores_seleccionados)
     
+    def cambiar_inicio_automatico(self, estado):
+        """Cambia el estado del inicio automático"""
+        if estado == Qt.Checked:
+            # Agregar al inicio
+            if self.parent_app.agregar_inicio_automatico():
+                QMessageBox.information(
+                    self,
+                    "Inicio Automático Activado",
+                    "El Organizador de Escritorio se ejecutará automáticamente al iniciar Windows."
+                )
+            else:
+                # Si falla, desmarcar el checkbox
+                self.checkbox_inicio.setChecked(False)
+                QMessageBox.warning(
+                    self,
+                    "Error",
+                    "No se pudo agregar al inicio de Windows.\n\n"
+                    "Asegúrate de tener permisos de administrador o intenta ejecutar el script 'agregar_inicio.bat' manualmente."
+                )
+        else:
+            # Remover del inicio
+            if self.parent_app.remover_inicio_automatico():
+                QMessageBox.information(
+                    self,
+                    "Inicio Automático Desactivado",
+                    "El Organizador de Escritorio ya no se ejecutará automáticamente al iniciar Windows."
+                )
+            else:
+                # Si no estaba en el inicio, no hacer nada
+                pass
+    
     def cargar_configuraciones(self):
         """Carga las configuraciones guardadas"""
+        # Cargar estado del inicio automático
+        if self.parent_app.verificar_inicio_automatico():
+            self.checkbox_inicio.setChecked(True)
+        else:
+            self.checkbox_inicio.setChecked(False)
+        
         # Cargar tamaño de iconos por defecto
         if "configuraciones" in self.parent_app.posiciones:
             config = self.parent_app.posiciones["configuraciones"]
@@ -2672,8 +3424,10 @@ class VentanaResultadosBusqueda(QWidget):
                 elemento = Path(ruta)
                 if elemento.exists():
                     os.startfile(str(elemento))
+            except (OSError, PermissionError, FileNotFoundError) as e:
+                QMessageBox.warning(self, "Error", f"No se pudo abrir el archivo:\n{str(e)}")
             except Exception as e:
-                QMessageBox.warning(self, "Error", f"No se pudo abrir: {str(e)}")
+                QMessageBox.warning(self, "Error", f"Error inesperado al abrir:\n{str(e)}")
 
 
 class PanelControl(QWidget):
@@ -2754,6 +3508,9 @@ class PanelControl(QWidget):
         accion_eliminar = menu.addAction("🗑️ Eliminar Casilla")
         accion_eliminar.triggered.connect(self.mostrar_dialogo_eliminar)
         menu.addSeparator()
+        accion_unificar = menu.addAction("📐 Unificar Tamaños de Casillas")
+        accion_unificar.triggered.connect(self.mostrar_dialogo_unificar_tamanos)
+        menu.addSeparator()
         accion_colores = menu.addAction("Configurar Colores")
         accion_colores.triggered.connect(self.mostrar_dialogo_colores)
         menu.addSeparator()
@@ -2817,6 +3574,78 @@ class PanelControl(QWidget):
         """Muestra el diálogo de configuraciones avanzadas"""
         dialog = DialogConfiguracionesAvanzadas(self, self.parent_app)
         dialog.exec_()
+    
+    def mostrar_dialogo_unificar_tamanos(self):
+        """Muestra un diálogo para unificar tamaños de casillas"""
+        if not self.parent_app.casillas:
+            QMessageBox.information(self, "Sin casillas", "No hay casillas para unificar.")
+            return
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Unificar Tamaños de Casillas")
+        dialog.setFixedSize(400, 200)
+        
+        layout = QVBoxLayout()
+        layout.setSpacing(15)
+        
+        # Título
+        label_titulo = QLabel("Selecciona cómo unificar los tamaños:")
+        label_titulo.setStyleSheet("font-weight: bold; font-size: 12px;")
+        layout.addWidget(label_titulo)
+        
+        # Opción 1: Usar tamaño actual de la primera casilla
+        btn_tamano_actual = QPushButton("Usar tamaño de la primera casilla")
+        btn_tamano_actual.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(80, 120, 160, 200);
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 10px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: rgba(100, 140, 180, 220);
+            }
+        """)
+        btn_tamano_actual.clicked.connect(lambda: self.unificar_tamanos(True, dialog))
+        
+        # Opción 2: Usar tamaños por defecto
+        btn_tamano_defecto = QPushButton("Usar tamaños por defecto")
+        btn_tamano_defecto.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(80, 120, 160, 200);
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 10px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: rgba(100, 140, 180, 220);
+            }
+        """)
+        btn_tamano_defecto.clicked.connect(lambda: self.unificar_tamanos(False, dialog))
+        
+        layout.addWidget(btn_tamano_actual)
+        layout.addWidget(btn_tamano_defecto)
+        layout.addStretch()
+        
+        # Botón cancelar
+        btn_cancelar = QPushButton("Cancelar")
+        btn_cancelar.clicked.connect(dialog.reject)
+        layout.addWidget(btn_cancelar)
+        
+        dialog.setLayout(layout)
+        dialog.exec_()
+    
+    def unificar_tamanos(self, usar_actual, dialog):
+        """Unifica los tamaños y cierra el diálogo"""
+        if self.parent_app.unificar_tamanos_casillas(usar_actual):
+            QMessageBox.information(self, "Tamaños unificados", 
+                                   f"Se han unificado los tamaños de todas las casillas.\n"
+                                   f"Se usó el tamaño {'actual' if usar_actual else 'por defecto'}.")
+        dialog.accept()
     
     def mostrar_dialogo_eliminar(self):
         """Muestra un diálogo para seleccionar y eliminar una casilla"""
@@ -3035,6 +3864,69 @@ class OrganizadorEscritorio:
         self.posiciones["panel"] = [posicion.x(), posicion.y()]
         self.guardar_posiciones()
     
+    def unificar_tamanos_casillas(self, usar_tamano_actual=False):
+        """
+        Unifica el tamaño de todas las casillas.
+        Si usar_tamano_actual es True, usa el tamaño de la primera casilla encontrada.
+        Si es False, usa los tamaños por defecto de las configuraciones.
+        """
+        if not self.casillas:
+            return False
+        
+        # Obtener tamaños objetivo
+        tamano_colapsado = None
+        tamano_expandido = None
+        
+        if usar_tamano_actual:
+            # Usar el tamaño de la primera casilla encontrada
+            primera_casilla = next(iter(self.casillas.values()))
+            if primera_casilla.tamano_personalizado_colapsado:
+                tamano_colapsado = primera_casilla.tamano_personalizado_colapsado
+            else:
+                tamano_colapsado = primera_casilla.tamano_colapsado
+            
+            if primera_casilla.tamano_personalizado_expandido:
+                tamano_expandido = primera_casilla.tamano_personalizado_expandido
+            else:
+                tamano_expandido = primera_casilla.tamano_expandido
+        else:
+            # Usar tamaños por defecto de las configuraciones
+            if "configuraciones" in self.posiciones:
+                config = self.posiciones["configuraciones"]
+                if "tamano_colapsado_defecto" in config:
+                    tamano_colapsado = tuple(config["tamano_colapsado_defecto"])
+                if "tamano_expandido_defecto" in config:
+                    tamano_expandido = tuple(config["tamano_expandido_defecto"])
+            
+            # Si no hay configuraciones, usar valores por defecto
+            if not tamano_colapsado:
+                tamano_colapsado = DEFAULT_COLLAPSED_SIZE
+            if not tamano_expandido:
+                tamano_expandido = DEFAULT_EXPANDED_SIZE
+        
+        # Aplicar tamaños a todas las casillas
+        for nombre, casilla in self.casillas.items():
+            estado_actual = casilla.expandida
+            
+            # Establecer tamaños personalizados
+            casilla.tamano_personalizado_colapsado = tamano_colapsado
+            casilla.tamano_personalizado_expandido = tamano_expandido
+            
+            # Aplicar el tamaño según el estado actual
+            if estado_actual:
+                casilla.resize(tamano_expandido[0], tamano_expandido[1])
+            else:
+                casilla.resize(tamano_colapsado[0], tamano_colapsado[1])
+            
+            # Actualizar indicador
+            casilla.actualizar_indicador_tamano()
+            
+            # Guardar tamaños
+            self.guardar_tamano_casilla(nombre, tamano_colapsado, False)
+            self.guardar_tamano_casilla(nombre, tamano_expandido, True)
+        
+        return True
+    
     def guardar_tamano_casilla(self, nombre, tamano, expandida):
         """Guarda el tamaño personalizado de una casilla (colapsado o expandido)"""
         if "tamanos" not in self.posiciones:
@@ -3116,6 +4008,100 @@ class OrganizadorEscritorio:
         for casilla in self.casillas.values():
             casilla.aplicar_colores(colores)
     
+    def verificar_inicio_automatico(self):
+        """Verifica si la aplicación está configurada para iniciar con Windows"""
+        startup_folder = Path(os.environ.get('APPDATA')) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+        shortcut_path = startup_folder / "Organizador Escritorio.lnk"
+        return shortcut_path.exists()
+    
+    def agregar_inicio_automatico(self):
+        """Agrega la aplicación al inicio de Windows"""
+        try:
+            # Intentar usar win32com si está disponible
+            try:
+                import win32com.client
+                use_win32com = True
+            except ImportError:
+                use_win32com = False
+            
+            # Detectar si se está ejecutando como .exe
+            if getattr(sys, 'frozen', False):
+                # Se está ejecutando como .exe
+                app_path = sys.executable  # Ruta del .exe
+                exe_dir = Path(app_path).parent.absolute()  # Carpeta donde está el .exe
+                # Si el .exe está en dist, usar la carpeta padre como working directory
+                if exe_dir.name == "dist":
+                    script_dir = exe_dir.parent.absolute()  # Carpeta del proyecto
+                else:
+                    script_dir = exe_dir
+            else:
+                # Se está ejecutando como script Python
+                script_dir = Path(__file__).parent.absolute()
+                # Verificar si existe el ejecutable .exe
+                exe_path = script_dir / "dist" / "Organizador Escritorio.exe"
+                if exe_path.exists():
+                    app_path = str(exe_path)
+                else:
+                    # Si no existe .exe, usar el script iniciar_organizador.bat si existe
+                    bat_script = script_dir / "iniciar_organizador.bat"
+                    if bat_script.exists():
+                        app_path = str(bat_script)
+                    else:
+                        # Usar el script Python directamente
+                        app_path = str(Path(__file__).absolute())
+            
+            # Obtener la carpeta de inicio
+            startup_folder = Path(os.environ.get('APPDATA')) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+            shortcut_path = startup_folder / "Organizador Escritorio.lnk"
+            
+            if use_win32com:
+                # Crear acceso directo usando win32com
+                shell = win32com.client.Dispatch("WScript.Shell")
+                shortcut = shell.CreateShortCut(str(shortcut_path))
+                shortcut.TargetPath = app_path
+                shortcut.WorkingDirectory = str(script_dir)
+                shortcut.Description = "Organizador de Escritorio"
+                shortcut.Save()
+                return True
+            else:
+                # Usar PowerShell
+                import subprocess
+                # Escapar las comillas y barras invertidas para PowerShell usando comillas simples
+                app_path_clean = app_path.replace("'", "''")  # Escapar comillas simples en PowerShell
+                script_dir_clean = str(script_dir).replace("'", "''")
+                shortcut_path_clean = str(shortcut_path).replace("'", "''")
+                
+                # Usar comillas simples en PowerShell para evitar problemas con espacios
+                ps_command = f"$WshShell = New-Object -ComObject WScript.Shell; $Shortcut = $WshShell.CreateShortcut('{shortcut_path_clean}'); $Shortcut.TargetPath = '{app_path_clean}'; $Shortcut.WorkingDirectory = '{script_dir_clean}'; $Shortcut.Description = 'Organizador de Escritorio'; $Shortcut.Save()"
+                
+                result = subprocess.run(['powershell', '-Command', ps_command], 
+                                      capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                
+                if result.returncode != 0:
+                    # Si falla, mostrar el error para debugging
+                    print(f"Error de PowerShell: {result.stderr}")
+                
+                return result.returncode == 0
+        except Exception as e:
+            print(f"Error al agregar al inicio: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def remover_inicio_automatico(self):
+        """Remueve la aplicación del inicio de Windows"""
+        try:
+            startup_folder = Path(os.environ.get('APPDATA')) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+            shortcut_path = startup_folder / "Organizador Escritorio.lnk"
+            
+            if shortcut_path.exists():
+                shortcut_path.unlink()
+                return True
+            return False
+        except Exception as e:
+            print(f"Error al remover del inicio: {e}")
+            return False
+    
     def detectar_colores_inicio(self):
         """Detecta automáticamente los colores del fondo al iniciar la aplicación"""
         ruta_fondo = obtener_ruta_fondo_escritorio()
@@ -3196,7 +4182,8 @@ class OrganizadorEscritorio:
         if tamano_expandido:
             casilla.tamano_personalizado_expandido = tamano_expandido
         
-        # Cargar tamaño de iconos personalizado si existe, sino usar el por defecto
+        # Cargar TODAS las configuraciones primero antes de actualizar la lista
+        # 1. Cargar tamaño de iconos personalizado si existe, sino usar el por defecto
         tamano_iconos = self.obtener_tamano_iconos(nombre)
         if tamano_iconos:
             casilla.tamano_iconos = tamano_iconos
@@ -3206,12 +4193,7 @@ class OrganizadorEscritorio:
             if "tamano_iconos_defecto" in config:
                 casilla.tamano_iconos = config["tamano_iconos_defecto"]
         
-        # Aplicar el tamaño de iconos y actualizar la lista
-        casilla.actualizar_tamano_iconos()
-        QApplication.processEvents()
-        casilla.actualizar_lista_archivos()
-        
-        # Aplicar multiplicador de resolución por defecto si existe
+        # 2. Aplicar multiplicador de resolución por defecto si existe (ANTES de generar iconos)
         if "configuraciones" in self.posiciones:
             config = self.posiciones["configuraciones"]
             if "multiplicador_resolucion_iconos" in config:
@@ -3221,15 +4203,29 @@ class OrganizadorEscritorio:
                 casilla.velocidad_scroll = config["velocidad_scroll"]
                 casilla.actualizar_velocidad_scroll()
         
-        # Aplicar tipo de vista (obtener_tipo_vista ya maneja el por defecto)
+        # 3. Aplicar tipo de vista (obtener_tipo_vista ya maneja el por defecto)
         tipo_vista = self.obtener_tipo_vista(nombre)
         casilla.tipo_vista = tipo_vista
         casilla.aplicar_tipo_vista()
+        
+        # 4. Ahora que todas las configuraciones están cargadas, aplicar el tamaño de iconos ANTES de actualizar la lista
+        # Primero establecer el tamaño de iconos en el widget (debe hacerse antes de agregar items)
+        casilla.actualizar_tamano_iconos()
+        QApplication.processEvents()
+        # Luego actualizar la lista (genera los iconos con el tamaño correcto que ya está establecido)
+        casilla.actualizar_lista_archivos()
+        QApplication.processEvents()
+        # Asegurar que el tamaño se mantenga después de agregar los items
+        casilla.actualizar_tamano_iconos()
+        QApplication.processEvents()
         
         # Aplicar colores personalizados si existen
         colores = self.obtener_colores_guardados()
         if colores:
             casilla.aplicar_colores(colores)
+        
+        # Actualizar indicador de tamaño
+        casilla.actualizar_indicador_tamano()
         
         casilla.archivo_soltado.connect(self.mover_archivo)
         casilla.casilla_eliminada.connect(self.eliminar_casilla)
@@ -3242,8 +4238,21 @@ class OrganizadorEscritorio:
     def mover_archivo(self, archivo_path, nombre_casilla):
         """Mueve un archivo o carpeta a la carpeta de la casilla"""
         try:
+            # Validar entrada
+            if not archivo_path or not nombre_casilla:
+                raise ValueError("Parámetros inválidos")
+            
+            if nombre_casilla not in self.casillas:
+                raise KeyError(f"Casilla '{nombre_casilla}' no encontrada")
+            
             elemento_origen = Path(archivo_path)
+            if not elemento_origen.exists():
+                raise FileNotFoundError(f"El elemento '{archivo_path}' no existe")
+            
             carpeta_destino = self.casillas[nombre_casilla].carpeta_path
+            if not carpeta_destino.exists():
+                carpeta_destino.mkdir(parents=True, exist_ok=True)
+            
             nombre_elemento = elemento_origen.name
             destino = carpeta_destino / nombre_elemento
             
@@ -3256,6 +4265,8 @@ class OrganizadorEscritorio:
                     nuevo_nombre = f"{nombre_base}_{contador}{extension}"
                     destino = carpeta_destino / nuevo_nombre
                     contador += 1
+                    if contador > 1000:  # Límite de seguridad
+                        raise ValueError("Demasiados archivos con el mismo nombre")
             else:
                 # Es una carpeta: no tiene extensión
                 nombre_base = nombre_elemento
@@ -3263,6 +4274,8 @@ class OrganizadorEscritorio:
                     nuevo_nombre = f"{nombre_base}_{contador}"
                     destino = carpeta_destino / nuevo_nombre
                     contador += 1
+                    if contador > 1000:  # Límite de seguridad
+                        raise ValueError("Demasiadas carpetas con el mismo nombre")
                 
             shutil.move(str(elemento_origen), str(destino))
             # Actualizar la lista de archivos en la casilla
@@ -3270,8 +4283,24 @@ class OrganizadorEscritorio:
                 self.casillas[nombre_casilla].actualizar_lista_archivos()
             
             # Mensaje eliminado - el movimiento se realiza silenciosamente
+        except (FileNotFoundError, PermissionError, OSError) as e:
+            QMessageBox.critical(
+                self.panel if hasattr(self, 'panel') else None, 
+                "Error", 
+                f"No se pudo mover el archivo:\n{str(e)}"
+            )
+        except (KeyError, ValueError) as e:
+            QMessageBox.warning(
+                self.panel if hasattr(self, 'panel') else None,
+                "Advertencia",
+                f"Error de validación:\n{str(e)}"
+            )
         except Exception as e:
-            QMessageBox.critical(self.panel, "Error", f"No se pudo mover: {str(e)}")
+            QMessageBox.critical(
+                self.panel if hasattr(self, 'panel') else None,
+                "Error Inesperado",
+                f"Ocurrió un error inesperado al mover el archivo:\n{str(e)}"
+            )
     
     def mover_archivo_entre_casillas(self, archivo_path, nombre_casilla_origen, nombre_casilla_destino):
         """Mueve un archivo de una casilla a otra"""
@@ -3358,8 +4387,12 @@ class OrganizadorEscritorio:
             desktop_path = winreg.QueryValueEx(key, "Desktop")[0]
             winreg.CloseKey(key)
             return Path(desktop_path)
-        except:
+        except (OSError, FileNotFoundError, PermissionError) as e:
             # Si falla, usar la ruta por defecto
+            print(f"Error al obtener ruta del escritorio desde registro: {e}")
+            return Path.home() / "Desktop"
+        except Exception as e:
+            print(f"Error inesperado al obtener ruta del escritorio: {e}")
             return Path.home() / "Desktop"
     
     def eliminar_casilla_completa(self, nombre_casilla):
@@ -3503,7 +4536,8 @@ class OrganizadorEscritorio:
                 if tamano_expandido:
                     casilla.tamano_personalizado_expandido = tamano_expandido
                 
-                # Cargar tamaño de iconos personalizado si existe, sino usar el por defecto
+                # Cargar TODAS las configuraciones primero antes de actualizar la lista
+                # 1. Cargar tamaño de iconos personalizado si existe, sino usar el por defecto
                 tamano_iconos = self.obtener_tamano_iconos(nombre)
                 if tamano_iconos:
                     casilla.tamano_iconos = tamano_iconos
@@ -3513,12 +4547,7 @@ class OrganizadorEscritorio:
                     if "tamano_iconos_defecto" in config:
                         casilla.tamano_iconos = config["tamano_iconos_defecto"]
                 
-                # Aplicar el tamaño de iconos y actualizar la lista
-                casilla.actualizar_tamano_iconos()
-                QApplication.processEvents()
-                casilla.actualizar_lista_archivos()
-                
-                # Aplicar multiplicador de resolución por defecto si existe
+                # 2. Aplicar multiplicador de resolución por defecto si existe (ANTES de generar iconos)
                 if "configuraciones" in self.posiciones:
                     config = self.posiciones["configuraciones"]
                     if "multiplicador_resolucion_iconos" in config:
@@ -3528,10 +4557,21 @@ class OrganizadorEscritorio:
                         casilla.velocidad_scroll = config["velocidad_scroll"]
                         casilla.actualizar_velocidad_scroll()
                 
-                # Aplicar tipo de vista (obtener_tipo_vista ya maneja el por defecto)
+                # 3. Aplicar tipo de vista (obtener_tipo_vista ya maneja el por defecto)
                 tipo_vista = self.obtener_tipo_vista(nombre)
                 casilla.tipo_vista = tipo_vista
                 casilla.aplicar_tipo_vista()
+                
+                # 4. Ahora que todas las configuraciones están cargadas, aplicar el tamaño de iconos ANTES de actualizar la lista
+                # Primero establecer el tamaño de iconos en el widget (debe hacerse antes de agregar items)
+                casilla.actualizar_tamano_iconos()
+                QApplication.processEvents()
+                # Luego actualizar la lista (genera los iconos con el tamaño correcto que ya está establecido)
+                casilla.actualizar_lista_archivos()
+                QApplication.processEvents()
+                # Asegurar que el tamaño se mantenga después de agregar los items
+                casilla.actualizar_tamano_iconos()
+                QApplication.processEvents()
                 
                 # Restaurar estado expandido/colapsado si existe
                 estados = self.posiciones.get("estados", {})
@@ -3540,11 +4580,20 @@ class OrganizadorEscritorio:
                     QApplication.processEvents()
                     if not casilla.expandida:
                         casilla.toggle_expandir()
+                        # Asegurar que el tamaño de iconos se mantenga después de expandir
+                        QApplication.processEvents()
+                        casilla.actualizar_tamano_iconos()
                 
                 # Aplicar colores personalizados si existen
                 colores = self.obtener_colores_guardados()
                 if colores:
                     casilla.aplicar_colores(colores)
+                    # Asegurar que el tamaño de iconos se mantenga después de aplicar colores
+                    QApplication.processEvents()
+                    casilla.actualizar_tamano_iconos()
+                
+                # Actualizar indicador de tamaño
+                casilla.actualizar_indicador_tamano()
                 
                 casilla.archivo_soltado.connect(self.mover_archivo)
                 casilla.casilla_eliminada.connect(self.eliminar_casilla)
@@ -3569,12 +4618,31 @@ class OrganizadorEscritorio:
 
 
 def main():
-    app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)  # No cerrar cuando se cierra una ventana
-    
-    organizador = OrganizadorEscritorio()
-    
-    sys.exit(app.exec_())
+    try:
+        app = QApplication(sys.argv)
+        app.setQuitOnLastWindowClosed(False)  # No cerrar cuando se cierra una ventana
+        
+        organizador = OrganizadorEscritorio()
+        
+        sys.exit(app.exec_())
+    except Exception as e:
+        # Si hay un error, intentar mostrarlo en un archivo de log
+        try:
+            log_file = Path.home() / "Desktop" / "Organizador_Casillas" / "error_log.txt"
+            log_file.parent.mkdir(exist_ok=True)
+            with open(log_file, 'a', encoding='utf-8') as f:
+                import traceback
+                f.write(f"\n{'='*50}\n")
+                f.write(f"Error al iniciar: {str(e)}\n")
+                f.write(f"Fecha: {__import__('datetime').datetime.now()}\n")
+                f.write(f"{traceback.format_exc()}\n")
+        except (OSError, PermissionError, UnicodeDecodeError) as log_error:
+            # Error al escribir el log, pero no es crítico
+            print(f"No se pudo escribir en el archivo de log: {log_error}")
+        except Exception as log_error:
+            print(f"Error inesperado al escribir log: {log_error}")
+        # Re-lanzar el error original para que se muestre
+        raise
 
 
 if __name__ == "__main__":
