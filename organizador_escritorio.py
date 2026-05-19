@@ -13,6 +13,7 @@ from pathlib import Path
 from collections import Counter
 
 from organizador_storage import PersistenceManager
+from organizador_ollama import OllamaClient, OllamaWorker
 from organizador_utils import (
     get_desktop_path,
     get_wallpaper_path,
@@ -28,8 +29,8 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QLineEdit, QMessageBox, QInputDialog, QFrame,
     QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
     QMenu, QColorDialog, QGroupBox, QGridLayout, QScrollBar,
-    QTabWidget, QSpinBox, QDoubleSpinBox, QSlider, QRadioButton, 
-    QButtonGroup, QCheckBox, QFileIconProvider
+    QTabWidget, QSpinBox, QDoubleSpinBox, QSlider, QRadioButton,
+    QButtonGroup, QCheckBox, QFileIconProvider, QComboBox, QTextEdit
 )
 from PyQt5.QtCore import Qt, QPoint, QMimeData, pyqtSignal, QSettings, QFileInfo, QSize, QTimer, QUrl
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QPainter, QColor, QFont, QImage, QIcon, QWheelEvent, QPixmap, QDrag
@@ -3042,6 +3043,386 @@ class VentanaResultadosBusqueda(QWidget):
                 QMessageBox.warning(self, "Error", f"Error inesperado al abrir:\n{str(e)}")
 
 
+class DialogComandoIA(QDialog):
+    """Diálogo de comandos en lenguaje natural usando Ollama."""
+
+    ESTILO_BTN_PRIMARIO = """
+        QPushButton {
+            background-color: rgba(80,130,180,220); color: white;
+            border: none; border-radius: 4px;
+            padding: 8px 14px; font-size: 11px; font-weight: bold;
+        }
+        QPushButton:hover { background-color: rgba(100,150,200,240); }
+        QPushButton:disabled { background-color: #bbb; color: #eee; }
+    """
+    ESTILO_BTN_VERDE = """
+        QPushButton {
+            background-color: rgba(60,160,80,220); color: white;
+            border: none; border-radius: 4px;
+            padding: 8px 20px; font-size: 11px; font-weight: bold; min-width: 80px;
+        }
+        QPushButton:hover { background-color: rgba(80,180,100,240); }
+        QPushButton:disabled { background-color: #bbb; color: #eee; }
+    """
+    ESTILO_BTN_NEUTRO = """
+        QPushButton {
+            background-color: #e8e8e8; color: #333;
+            border: none; border-radius: 4px;
+            padding: 8px 20px; font-size: 11px; min-width: 80px;
+        }
+        QPushButton:hover { background-color: #d0d0d0; }
+    """
+
+    def __init__(self, parent=None, parent_app=None):
+        super().__init__(parent)
+        self.parent_app = parent_app
+        self.acciones_pendientes = []
+        self.worker = None
+        self._historial = []
+        self._historial_idx = -1
+        self.setup_ui()
+        self._inicializar_modelos()
+
+    # ------------------------------------------------------------------ UI --
+
+    def setup_ui(self):
+        self.setWindowTitle("Asistente IA - Ollama")
+        self.setFixedSize(520, 560)
+        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+
+        layout = QVBoxLayout()
+        layout.setSpacing(10)
+        layout.setContentsMargins(18, 16, 18, 16)
+
+        # — Encabezado -------------------------------------------------------
+        header = QHBoxLayout()
+        lbl_titulo = QLabel("Asistente IA (Ollama)")
+        lbl_titulo.setStyleSheet("font-weight: bold; font-size: 13px; color: #222;")
+        self.lbl_estado = QLabel("⚪ Conectando...")
+        self.lbl_estado.setStyleSheet("font-size: 10px; color: #888;")
+        header.addWidget(lbl_titulo)
+        header.addStretch()
+        header.addWidget(self.lbl_estado)
+
+        # — Modelo -----------------------------------------------------------
+        modelo_row = QHBoxLayout()
+        lbl_modelo = QLabel("Modelo:")
+        lbl_modelo.setStyleSheet("font-size: 11px; color: #444; min-width: 52px;")
+        self.combo_modelo = QComboBox()
+        self.combo_modelo.setEditable(True)
+        self.combo_modelo.setFixedWidth(200)
+        self.combo_modelo.setStyleSheet("""
+            QComboBox {
+                padding: 4px 8px; font-size: 11px;
+                border: 1px solid #ccc; border-radius: 4px; background: white;
+            }
+            QComboBox::drop-down { border: none; }
+        """)
+        modelo_row.addWidget(lbl_modelo)
+        modelo_row.addWidget(self.combo_modelo)
+        modelo_row.addStretch()
+
+        sep1 = QFrame(); sep1.setFrameShape(QFrame.HLine)
+        sep1.setStyleSheet("color: #e0e0e0;")
+
+        # — Entrada de comando -----------------------------------------------
+        lbl_cmd = QLabel("Comando:  (↑ ↓ para historial)")
+        lbl_cmd.setStyleSheet("font-size: 11px; color: #555; font-weight: bold;")
+
+        cmd_row = QHBoxLayout()
+        self.input_comando = QLineEdit()
+        self.input_comando.setPlaceholderText(
+            "Ej: mover todos los .rar del escritorio a Archivos Comprimidos"
+        )
+        self.input_comando.setStyleSheet("""
+            QLineEdit {
+                padding: 8px; font-size: 11px;
+                border: 1px solid #ccc; border-radius: 4px; background: white;
+            }
+            QLineEdit:focus { border: 1px solid rgba(100,150,200,200); }
+        """)
+        self.input_comando.returnPressed.connect(self.procesar)
+        self.input_comando.installEventFilter(self)
+
+        self.btn_procesar = QPushButton("Procesar")
+        self.btn_procesar.setFixedWidth(90)
+        self.btn_procesar.setStyleSheet(self.ESTILO_BTN_PRIMARIO)
+        self.btn_procesar.clicked.connect(self.procesar)
+
+        self.btn_cancelar_proc = QPushButton("Detener")
+        self.btn_cancelar_proc.setFixedWidth(75)
+        self.btn_cancelar_proc.setVisible(False)
+        self.btn_cancelar_proc.setStyleSheet("""
+            QPushButton {
+                background: rgba(200,60,60,200); color: white;
+                border: none; border-radius: 4px; padding: 8px; font-size: 11px;
+            }
+            QPushButton:hover { background: rgba(220,80,80,220); }
+        """)
+        self.btn_cancelar_proc.clicked.connect(self._detener_worker)
+
+        cmd_row.addWidget(self.input_comando, stretch=1)
+        cmd_row.addWidget(self.btn_procesar)
+        cmd_row.addWidget(self.btn_cancelar_proc)
+
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.HLine)
+        sep2.setStyleSheet("color: #e0e0e0;")
+
+        # — Respuesta de Ollama ----------------------------------------------
+        self.lbl_entendido_titulo = QLabel("Ollama entendió:")
+        self.lbl_entendido_titulo.setStyleSheet("font-size: 11px; color: #444; font-weight: bold;")
+        self.lbl_entendido_titulo.hide()
+
+        self.lbl_entendido = QLabel()
+        self.lbl_entendido.setWordWrap(True)
+        self.lbl_entendido.setStyleSheet("""
+            QLabel {
+                font-size: 11px; color: #333;
+                background: #f0f4f8; border: 1px solid #d0d8e4;
+                border-radius: 4px; padding: 8px;
+            }
+        """)
+        self.lbl_entendido.hide()
+
+        # — Acciones previstas -----------------------------------------------
+        self.lbl_acciones_titulo = QLabel("Acciones a ejecutar:")
+        self.lbl_acciones_titulo.setStyleSheet("font-size: 11px; color: #444; font-weight: bold;")
+        self.lbl_acciones_titulo.hide()
+
+        self.lista_acciones = QListWidget()
+        self.lista_acciones.setStyleSheet("""
+            QListWidget {
+                font-size: 11px; border: 1px solid #ccc;
+                border-radius: 4px; background: #fafafa;
+            }
+        """)
+        self.lista_acciones.setFixedHeight(90)
+        self.lista_acciones.hide()
+
+        # — Resultados tras ejecutar -----------------------------------------
+        self.lbl_resultados_titulo = QLabel("Resultados:")
+        self.lbl_resultados_titulo.setStyleSheet("font-size: 11px; color: #444; font-weight: bold;")
+        self.lbl_resultados_titulo.hide()
+
+        self.area_resultados = QTextEdit()
+        self.area_resultados.setReadOnly(True)
+        self.area_resultados.setFixedHeight(80)
+        self.area_resultados.setStyleSheet("""
+            QTextEdit {
+                font-size: 11px; border: 1px solid #ccc;
+                border-radius: 4px; background: #f8fff8;
+            }
+        """)
+        self.area_resultados.hide()
+
+        # — Botones inferiores -----------------------------------------------
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self.btn_cerrar = QPushButton("Cerrar")
+        self.btn_cerrar.setStyleSheet(self.ESTILO_BTN_NEUTRO)
+        self.btn_cerrar.clicked.connect(self.accept)
+
+        self.btn_ejecutar = QPushButton("Ejecutar")
+        self.btn_ejecutar.setEnabled(False)
+        self.btn_ejecutar.setStyleSheet(self.ESTILO_BTN_VERDE)
+        self.btn_ejecutar.clicked.connect(self._ejecutar)
+        btn_row.addWidget(self.btn_cerrar)
+        btn_row.addWidget(self.btn_ejecutar)
+
+        # — Ensamblar --------------------------------------------------------
+        layout.addLayout(header)
+        layout.addLayout(modelo_row)
+        layout.addWidget(sep1)
+        layout.addWidget(lbl_cmd)
+        layout.addLayout(cmd_row)
+        layout.addWidget(sep2)
+        layout.addWidget(self.lbl_entendido_titulo)
+        layout.addWidget(self.lbl_entendido)
+        layout.addWidget(self.lbl_acciones_titulo)
+        layout.addWidget(self.lista_acciones)
+        layout.addWidget(self.lbl_resultados_titulo)
+        layout.addWidget(self.area_resultados)
+        layout.addStretch()
+        layout.addLayout(btn_row)
+        self.setLayout(layout)
+
+    # ---------------------------------------------------------------- init --
+
+    def _inicializar_modelos(self):
+        """Verifica Ollama y puebla el combo de modelos en segundo plano."""
+        client = OllamaClient()
+        if client.is_available():
+            self.lbl_estado.setText("🟢 Ollama disponible")
+            self.lbl_estado.setStyleSheet("font-size: 10px; color: green;")
+            modelos = client.get_models()
+            if modelos:
+                self.combo_modelo.addItems(modelos)
+                # Preferir llama3.2 si está disponible
+                for i, m in enumerate(modelos):
+                    if "llama3.2" in m:
+                        self.combo_modelo.setCurrentIndex(i)
+                        break
+            else:
+                self.combo_modelo.addItem("llama3.2")
+        else:
+            self.lbl_estado.setText("🔴 Ollama no disponible")
+            self.lbl_estado.setStyleSheet("font-size: 10px; color: red;")
+            self.combo_modelo.addItem("llama3.2")
+
+    # -------------------------------------------------------- historial ↑↓ --
+
+    def eventFilter(self, obj, event):
+        """Navega el historial de comandos con las teclas ↑ y ↓."""
+        from PyQt5.QtCore import QEvent
+        if obj is self.input_comando and event.type() == QEvent.KeyPress:
+            key = event.key()
+            if key == Qt.Key_Up and self._historial:
+                self._historial_idx = max(0, self._historial_idx - 1)
+                self.input_comando.setText(self._historial[self._historial_idx])
+                return True
+            if key == Qt.Key_Down and self._historial:
+                if self._historial_idx < len(self._historial) - 1:
+                    self._historial_idx += 1
+                    self.input_comando.setText(self._historial[self._historial_idx])
+                else:
+                    self._historial_idx = len(self._historial)
+                    self.input_comando.clear()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _agregar_historial(self, texto):
+        if texto and (not self._historial or self._historial[-1] != texto):
+            self._historial.append(texto)
+        self._historial_idx = len(self._historial)
+
+    # ----------------------------------------------------------- procesar --
+
+    def procesar(self):
+        texto = self.input_comando.text().strip()
+        if not texto:
+            return
+
+        modelo = self.combo_modelo.currentText().strip() or "llama3.2"
+        client = OllamaClient(model=modelo)
+
+        if not client.is_available():
+            QMessageBox.warning(
+                self, "Ollama no disponible",
+                "No se puede conectar a Ollama.\n\n"
+                "Asegurate de que Ollama esté instalado y ejecutándose.\n"
+                "Descarga en: https://ollama.com"
+            )
+            return
+
+        self._agregar_historial(texto)
+        contexto = self.parent_app.obtener_contexto_casillas() if self.parent_app else {}
+
+        # Resetear área de resultados y acciones
+        self._limpiar_resultado()
+        self.btn_procesar.setEnabled(False)
+        self.btn_procesar.setVisible(False)
+        self.btn_cancelar_proc.setVisible(True)
+        self.btn_ejecutar.setEnabled(False)
+
+        self.worker = OllamaWorker(client, texto, contexto)
+        self.worker.resultado.connect(self._on_resultado)
+        self.worker.error.connect(self._on_error)
+        self.worker.start()
+
+    def _detener_worker(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait(500)
+        self._restaurar_controles()
+
+    def _restaurar_controles(self):
+        self.btn_procesar.setEnabled(True)
+        self.btn_procesar.setVisible(True)
+        self.btn_cancelar_proc.setVisible(False)
+
+    def _limpiar_resultado(self):
+        self.lbl_entendido_titulo.hide()
+        self.lbl_entendido.hide()
+        self.lbl_acciones_titulo.hide()
+        self.lista_acciones.hide()
+        self.lista_acciones.clear()
+        self.lbl_resultados_titulo.hide()
+        self.area_resultados.hide()
+        self.area_resultados.clear()
+        self.acciones_pendientes = []
+
+    # --------------------------------------------------------- on_resultado --
+
+    def _on_resultado(self, resultado):
+        self._restaurar_controles()
+
+        entendido = resultado.get("entendido", "")
+        acciones = resultado.get("acciones", [])
+
+        self.lbl_entendido_titulo.show()
+        self.lbl_entendido.setText(entendido or "(sin descripción)")
+        self.lbl_entendido.show()
+
+        acciones_reales = [a for a in acciones if a.get("tipo") != "nada"]
+        acciones_nada = [a for a in acciones if a.get("tipo") == "nada"]
+
+        if acciones_reales:
+            self.lbl_acciones_titulo.show()
+            self.lista_acciones.show()
+            for accion in acciones_reales:
+                self.lista_acciones.addItem(self._describir_accion(accion))
+            self.acciones_pendientes = acciones_reales
+            self.btn_ejecutar.setEnabled(True)
+        elif acciones_nada:
+            msg = acciones_nada[0].get("mensaje", "No hay acciones para ejecutar.")
+            self.lbl_entendido.setText(f"{entendido}\n\n⚠ {msg}")
+
+    def _on_error(self, mensaje):
+        self._restaurar_controles()
+        QMessageBox.critical(
+            self, "Error de Ollama",
+            f"Error al procesar el comando:\n\n{mensaje}\n\n"
+            "Verificá que el modelo esté descargado: ollama pull llama3.2"
+        )
+
+    # ----------------------------------------------------------- describir --
+
+    def _describir_accion(self, accion):
+        tipo = accion.get("tipo")
+        if tipo == "crear_casilla":
+            return f"+ Crear casilla: {accion.get('nombre')}"
+        if tipo == "eliminar_casilla":
+            return f"x Eliminar casilla: {accion.get('nombre')}"
+        if tipo == "renombrar_casilla":
+            return f"~ Renombrar: '{accion.get('nombre_actual')}' → '{accion.get('nuevo_nombre')}'"
+        if tipo == "mover_archivo":
+            return (f"→ Mover '{accion.get('archivo')}' "
+                    f"de '{accion.get('casilla_origen')}' a '{accion.get('casilla_destino')}'")
+        if tipo == "mover_tipo":
+            return (f"→ Mover todos los {accion.get('extension')} "
+                    f"de '{accion.get('casilla_origen')}' a '{accion.get('casilla_destino')}'")
+        return f"? {tipo}"
+
+    # ------------------------------------------------------------- ejecutar --
+
+    def _ejecutar(self):
+        if not (self.parent_app and self.acciones_pendientes):
+            return
+
+        self.btn_ejecutar.setEnabled(False)
+        resultados = self.parent_app.ejecutar_acciones_ia(self.acciones_pendientes)
+        self.acciones_pendientes = []
+
+        # Mostrar resultados inline sin cerrar el diálogo
+        self.lbl_resultados_titulo.show()
+        self.area_resultados.show()
+        self.area_resultados.setPlainText("\n".join(resultados))
+
+        # Limpiar comando para permitir escribir el siguiente
+        self.input_comando.clear()
+        self.input_comando.setFocus()
+
+
 class PanelControl(QWidget):
     """Panel de control compacto para crear nuevas casillas"""
     
@@ -3128,6 +3509,9 @@ class PanelControl(QWidget):
         menu.addSeparator()
         accion_avanzadas = menu.addAction("⚙️ Configuraciones Avanzadas")
         accion_avanzadas.triggered.connect(self.mostrar_configuraciones_avanzadas)
+        menu.addSeparator()
+        accion_ia = menu.addAction("✦ Comando IA (Ollama)")
+        accion_ia.triggered.connect(self.mostrar_dialogo_ia)
         btn_menu.setMenu(menu)
         
         layout.addWidget(self.input_buscar, stretch=1)
@@ -3185,6 +3569,11 @@ class PanelControl(QWidget):
     def mostrar_configuraciones_avanzadas(self):
         """Muestra el diálogo de configuraciones avanzadas"""
         dialog = DialogConfiguracionesAvanzadas(self, self.parent_app)
+        dialog.exec_()
+
+    def mostrar_dialogo_ia(self):
+        """Abre el diálogo de comandos en lenguaje natural con Ollama"""
+        dialog = DialogComandoIA(self, self.parent_app)
         dialog.exec_()
     
     def mostrar_dialogo_unificar_tamanos(self):
@@ -4007,29 +4396,29 @@ class OrganizadorEscritorio:
             print(f"Error inesperado al obtener ruta del escritorio: {e}")
             return Path.home() / "Desktop"
     
-    def eliminar_casilla_completa(self, nombre_casilla):
+    def eliminar_casilla_completa(self, nombre_casilla, pedir_confirmacion=True):
         """Elimina una casilla completamente, moviendo sus archivos al escritorio"""
         if nombre_casilla not in self.casillas:
             QMessageBox.warning(self.panel, "Error", f"La casilla '{nombre_casilla}' no existe.")
             return
-        
+
         casilla = self.casillas[nombre_casilla]
         carpeta_casilla = casilla.carpeta_path
         ruta_escritorio = self.obtener_ruta_escritorio()
-        
-        # Confirmar eliminación
-        respuesta = QMessageBox.question(
-            self.panel,
-            "Confirmar eliminación",
-            f"¿Eliminar la casilla '{nombre_casilla}'?\n\n"
-            f"Los archivos de la casilla se moverán al escritorio:\n{ruta_escritorio}\n\n"
-            f"La carpeta de la casilla será eliminada.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        
-        if respuesta != QMessageBox.Yes:
-            return
+
+        # Confirmar eliminación (puede omitirse en flujos automatizados)
+        if pedir_confirmacion:
+            respuesta = QMessageBox.question(
+                self.panel,
+                "Confirmar eliminación",
+                f"¿Eliminar la casilla '{nombre_casilla}'?\n\n"
+                f"Los archivos de la casilla se moverán al escritorio:\n{ruta_escritorio}\n\n"
+                f"La carpeta de la casilla será eliminada.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if respuesta != QMessageBox.Yes:
+                return
         
         # Mover archivos al escritorio
         archivos_movidos = 0
@@ -4220,6 +4609,190 @@ class OrganizadorEscritorio:
             pos = self.posiciones["panel"]
             self.panel.move(pos[0], pos[1])
     
+    def obtener_contexto_casillas(self):
+        """Retorna el estado actual del escritorio y casillas para el contexto de Ollama."""
+        contexto = {}
+
+        # Archivos y carpetas del escritorio (excluye la carpeta base del organizador)
+        try:
+            escritorio = self.obtener_ruta_escritorio()
+            carpeta_base_nombre = self.carpeta_base.name
+            entradas = []
+            for f in escritorio.iterdir():
+                if f.name.startswith(".") or f.name == carpeta_base_nombre:
+                    continue
+                entradas.append(f.name + "/" if f.is_dir() else f.name)
+            contexto["Escritorio"] = entradas
+        except Exception:
+            contexto["Escritorio"] = []
+
+        # Archivos y carpetas de cada casilla
+        for nombre, casilla in self.casillas.items():
+            try:
+                entradas = []
+                for f in casilla.carpeta_path.iterdir():
+                    if not f.name.startswith("."):
+                        entradas.append(f.name + "/" if f.is_dir() else f.name)
+                contexto[nombre] = entradas
+            except Exception:
+                contexto[nombre] = []
+        return contexto
+
+    def _buscar_archivo_en_carpeta(self, carpeta, nombre_archivo):
+        """Busca un archivo/carpeta con tolerancia a mayúsculas. Retorna Path o None."""
+        exacta = carpeta / nombre_archivo
+        if exacta.exists():
+            return exacta
+        nombre_lower = nombre_archivo.lower()
+        try:
+            for f in carpeta.iterdir():
+                if f.name.lower() == nombre_lower:
+                    return f
+        except Exception:
+            pass
+        return None
+
+    def renombrar_casilla(self, nombre_actual, nuevo_nombre):
+        """Renombra una casilla y su carpeta en disco. Retorna (ok, mensaje)."""
+        if nombre_actual not in self.casillas:
+            return False, f"La casilla '{nombre_actual}' no existe"
+        if nuevo_nombre in self.casillas:
+            return False, f"Ya existe una casilla llamada '{nuevo_nombre}'"
+
+        casilla = self.casillas[nombre_actual]
+        carpeta_nueva = self.carpeta_base / nuevo_nombre
+        try:
+            casilla.carpeta_path.rename(carpeta_nueva)
+        except Exception as e:
+            return False, f"No se pudo renombrar la carpeta: {e}"
+
+        # Actualizar estado interno de la casilla
+        casilla.nombre = nuevo_nombre
+        casilla.carpeta_path = carpeta_nueva
+        casilla.label_nombre.setText(nuevo_nombre)
+        casilla.actualizar_titulo()
+
+        # Reubicar en el diccionario
+        self.casillas[nuevo_nombre] = self.casillas.pop(nombre_actual)
+
+        # Actualizar posiciones guardadas
+        for key in ["casillas", "tamanos", "tamanos_iconos", "tipos_vista", "estados"]:
+            data = self.posiciones.get(key, {})
+            if nombre_actual in data:
+                data[nuevo_nombre] = data.pop(nombre_actual)
+
+        self.guardar_posiciones()
+        return True, f"Casilla renombrada: '{nombre_actual}' → '{nuevo_nombre}'"
+
+    def ejecutar_acciones_ia(self, acciones):
+        """Ejecuta la lista de acciones generada por Ollama y retorna un resumen."""
+        resultados = []
+        for accion in acciones:
+            tipo = accion.get("tipo")
+            try:
+                if tipo == "crear_casilla":
+                    nombre = accion.get("nombre", "").strip()
+                    if not nombre:
+                        resultados.append("⚠ Nombre de casilla vacío")
+                    elif nombre in self.casillas:
+                        resultados.append(f"⚠ La casilla '{nombre}' ya existe")
+                    else:
+                        self.crear_casilla(nombre)
+                        resultados.append(f"+ Casilla '{nombre}' creada")
+
+                elif tipo == "eliminar_casilla":
+                    nombre = accion.get("nombre", "").strip()
+                    if nombre in self.casillas:
+                        self.eliminar_casilla_completa(nombre, pedir_confirmacion=False)
+                        resultados.append(f"x Casilla '{nombre}' eliminada")
+                    else:
+                        resultados.append(f"⚠ La casilla '{nombre}' no existe")
+
+                elif tipo == "renombrar_casilla":
+                    nombre_actual = accion.get("nombre_actual", "").strip()
+                    nuevo_nombre = accion.get("nuevo_nombre", "").strip()
+                    ok, msg = self.renombrar_casilla(nombre_actual, nuevo_nombre)
+                    resultados.append(("" if ok else "⚠ ") + msg)
+
+                elif tipo == "mover_archivo":
+                    archivo = accion.get("archivo", "").strip()
+                    origen = accion.get("casilla_origen", "").strip()
+                    destino = accion.get("casilla_destino", "").strip()
+
+                    if origen.lower() == "escritorio":
+                        carpeta_origen = self.obtener_ruta_escritorio()
+                    elif origen in self.casillas:
+                        carpeta_origen = self.casillas[origen].carpeta_path
+                    else:
+                        resultados.append(f"⚠ Origen '{origen}' no existe"); continue
+
+                    ruta = self._buscar_archivo_en_carpeta(carpeta_origen, archivo)
+                    if not ruta:
+                        resultados.append(f"⚠ '{archivo}' no encontrado en '{origen}'")
+                        continue
+
+                    if destino.lower() == "escritorio":
+                        self.mover_archivo_al_escritorio(str(ruta))
+                        resultados.append(f"→ '{ruta.name}' movido de '{origen}' al escritorio")
+                    elif destino in self.casillas:
+                        if origen.lower() == "escritorio":
+                            self.mover_archivo(str(ruta), destino)
+                        else:
+                            self.mover_archivo_entre_casillas(str(ruta), origen, destino)
+                        resultados.append(f"→ '{ruta.name}' movido de '{origen}' a '{destino}'")
+                    else:
+                        resultados.append(f"⚠ Destino '{destino}' no existe")
+
+                elif tipo == "mover_tipo":
+                    ext = accion.get("extension", "").strip().lower()
+                    if not ext.startswith("."):
+                        ext = "." + ext
+                    origen = accion.get("casilla_origen", "").strip()
+                    destino = accion.get("casilla_destino", "").strip()
+
+                    if origen.lower() == "escritorio":
+                        carpeta_origen = self.obtener_ruta_escritorio()
+                    elif origen in self.casillas:
+                        carpeta_origen = self.casillas[origen].carpeta_path
+                    else:
+                        resultados.append(f"⚠ Origen '{origen}' no existe"); continue
+
+                    try:
+                        archivos_ext = [
+                            f for f in carpeta_origen.iterdir()
+                            if f.is_file() and f.suffix.lower() == ext
+                        ]
+                    except Exception:
+                        archivos_ext = []
+
+                    if not archivos_ext:
+                        resultados.append(f"⚠ No hay archivos {ext} en '{origen}'")
+                        continue
+
+                    movidos = 0
+                    for ruta in archivos_ext:
+                        try:
+                            if destino.lower() == "escritorio":
+                                self.mover_archivo_al_escritorio(str(ruta))
+                            elif destino in self.casillas:
+                                if origen.lower() == "escritorio":
+                                    self.mover_archivo(str(ruta), destino)
+                                else:
+                                    self.mover_archivo_entre_casillas(str(ruta), origen, destino)
+                            else:
+                                resultados.append(f"⚠ Destino '{destino}' no existe"); break
+                            movidos += 1
+                        except Exception as e:
+                            resultados.append(f"✗ Error moviendo '{ruta.name}': {e}")
+
+                    if movidos:
+                        resultados.append(f"→ {movidos} archivo(s) {ext} movidos de '{origen}' a '{destino}'")
+
+            except Exception as e:
+                resultados.append(f"✗ Error en '{tipo}': {str(e)}")
+
+        return resultados
+
     def cerrar_todo(self):
         """Cierra todas las ventanas y la aplicación"""
         self.guardar_posiciones()
