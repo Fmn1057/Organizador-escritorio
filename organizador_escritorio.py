@@ -8,15 +8,24 @@ import shutil
 import json
 import subprocess
 import traceback
-from datetime import datetime
+import winreg
 from pathlib import Path
 from collections import Counter
-from typing import Optional, Tuple, Dict, Any
+
+from organizador_storage import PersistenceManager
+from organizador_utils import (
+    get_desktop_path,
+    get_wallpaper_path,
+    analyze_image_colors,
+    generate_color_palette,
+    get_file_icon,
+    move_with_collision,
+)
 
 # PyQt5 imports - organizados y sin duplicados
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
-    QLabel, QPushButton, QLineEdit, QMessageBox, QFrame,
+    QLabel, QPushButton, QLineEdit, QMessageBox, QInputDialog, QFrame,
     QListWidget, QListWidgetItem, QDialog, QDialogButtonBox,
     QMenu, QColorDialog, QGroupBox, QGridLayout, QScrollBar,
     QTabWidget, QSpinBox, QDoubleSpinBox, QSlider, QRadioButton, 
@@ -35,145 +44,6 @@ DEFAULT_COLLAPSED_SIZE = (140, 50)
 DEFAULT_EXPANDED_SIZE = (280, 400)
 MAX_COLLISION_ATTEMPTS = 50
 SNAP_THRESHOLD = 10  # Píxeles de tolerancia para el snap/alineación
-SNAP_THRESHOLD = 10  # Píxeles de tolerancia para el snap/alineación
-
-
-def obtener_icono_desde_url(ruta_archivo):
-    """
-    Intenta obtener el icono de un archivo .url usando múltiples métodos.
-    Los archivos .url pueden tener iconos en IconFile o se pueden obtener desde el shell de Windows.
-    """
-    try:
-        ruta_path = Path(ruta_archivo)
-        if not ruta_path.exists() or ruta_path.suffix.lower() != '.url':
-            return None
-        
-        # Método 1: Intentar usar win32com para obtener el icono del acceso directo .url
-        try:
-            import win32com.client
-            shell = win32com.client.Dispatch("WScript.Shell")
-            shortcut = shell.CreateShortcut(str(ruta_path))
-            
-            # Obtener el icono del acceso directo si tiene uno personalizado
-            if hasattr(shortcut, 'IconLocation') and shortcut.IconLocation:
-                icon_location = shortcut.IconLocation
-                if icon_location:
-                    # IconLocation puede ser "ruta,índice" o solo "ruta"
-                    if ',' in icon_location:
-                        icon_path, icon_index = icon_location.rsplit(',', 1)
-                        try:
-                            icon_index = int(icon_index)
-                        except ValueError:
-                            icon_index = 0
-                    else:
-                        icon_path = icon_location
-                        icon_index = 0
-                    
-                    icon_path = os.path.expandvars(icon_path.strip())
-                    if os.path.exists(icon_path):
-                        # Intentar obtener el icono con el índice específico
-                        file_info = QFileInfo(icon_path)
-                        icon_provider = QFileIconProvider()
-                        icono = icon_provider.icon(file_info)
-                        if icono and not icono.isNull():
-                            # Si hay un índice específico, intentar extraerlo del archivo
-                            if icon_index > 0 and icon_path.lower().endswith(('.exe', '.dll', '.ico')):
-                                # Para archivos con múltiples iconos, Qt debería manejarlo automáticamente
-                                # pero podemos intentar obtener el icono específico
-                                pass
-                            return icono
-            
-            # Si no hay IconLocation, intentar obtener el icono del destino
-            if hasattr(shortcut, 'TargetPath') and shortcut.TargetPath:
-                target_path = os.path.expandvars(shortcut.TargetPath)
-                if os.path.exists(target_path):
-                    file_info = QFileInfo(target_path)
-                    icon_provider = QFileIconProvider()
-                    icono = icon_provider.icon(file_info)
-                    if icono and not icono.isNull():
-                        return icono
-        except ImportError:
-            # win32com no está disponible, continuar con otros métodos
-            pass
-        except Exception:
-            # Error al usar win32com, continuar con otros métodos
-            pass
-        
-        # Método 2: Leer el archivo .url y buscar IconFile manualmente
-        try:
-            with open(ruta_path, 'r', encoding='utf-8', errors='ignore') as f:
-                contenido = f.read()
-            
-            icono_path = None
-            icon_index = 0
-            
-            # Buscar IconFile e IconIndex en el contenido
-            for linea in contenido.split('\n'):
-                linea = linea.strip()
-                if linea.startswith('IconFile='):
-                    icono_path = linea.split('=', 1)[1].strip()
-                elif linea.startswith('IconIndex='):
-                    try:
-                        icon_index = int(linea.split('=', 1)[1].strip())
-                    except ValueError:
-                        icon_index = 0
-                elif linea.startswith('URL='):
-                    url = linea.split('=', 1)[1].strip()
-                    # Si es un juego de Steam, intentar obtener el icono de Steam
-                    if url.startswith('steam://') and not icono_path:
-                        # Buscar steam.exe en ubicaciones comunes
-                        posibles_rutas_steam = [
-                            Path(os.environ.get('ProgramFiles(x86)', '')) / 'Steam' / 'steam.exe',
-                            Path(os.environ.get('ProgramFiles', '')) / 'Steam' / 'steam.exe',
-                            Path.home() / 'AppData' / 'Local' / 'Programs' / 'Steam' / 'steam.exe',
-                            Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'Steam' / 'steam.exe',
-                        ]
-                        for ruta_steam in posibles_rutas_steam:
-                            if ruta_steam.exists():
-                                icono_path = str(ruta_steam)
-                                break
-            
-            # Si encontramos una ruta de icono, intentar obtener el icono
-            if icono_path:
-                icono_path = os.path.expandvars(icono_path)  # Expandir variables de entorno
-                
-                # Manejar rutas con índice (formato "ruta,índice")
-                if ',' in icono_path:
-                    partes = icono_path.rsplit(',', 1)
-                    icono_path = partes[0].strip()
-                    try:
-                        icon_index = int(partes[1].strip())
-                    except ValueError:
-                        icon_index = 0
-                
-                if os.path.exists(icono_path):
-                    file_info = QFileInfo(icono_path)
-                    icon_provider = QFileIconProvider()
-                    icono = icon_provider.icon(file_info)
-                    if icono and not icono.isNull():
-                        return icono
-        except Exception:
-            pass
-        
-        # Método 3: Intentar usar el shell de Windows directamente
-        try:
-            # Usar QFileInfo directamente en el archivo .url
-            # Windows debería resolver automáticamente el icono del acceso directo
-            file_info = QFileInfo(str(ruta_path))
-            icon_provider = QFileIconProvider()
-            icono = icon_provider.icon(file_info)
-            if icono and not icono.isNull():
-                pixmap_test = icono.pixmap(32, 32)
-                if not pixmap_test.isNull() and not pixmap_test.rect().isEmpty():
-                    if pixmap_test.width() > 0 and pixmap_test.height() > 0:
-                        return icono
-        except Exception:
-            pass
-        
-        return None
-    except Exception:
-        # Error silencioso - se usará el método alternativo
-        return None
 
 
 class CasillaVentana(QWidget):
@@ -441,6 +311,8 @@ class CasillaVentana(QWidget):
         self.lista_archivos.setDragEnabled(True)
         self.lista_archivos.setDragDropMode(QListWidget.DragDrop)
         self.lista_archivos.setDefaultDropAction(Qt.MoveAction)
+        self.lista_archivos.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.lista_archivos.customContextMenuRequested.connect(self.mostrar_menu_contextual_archivo)
         # Conectar el evento de inicio de drag para personalizar el MIME data
         self.lista_archivos.startDrag = self.iniciar_drag_archivo
         
@@ -1688,99 +1560,12 @@ class CasillaVentana(QWidget):
             int(self.tamano_iconos * multiplicador)
         )
         
-        # Función auxiliar para obtener icono con fallbacks
+        # Función auxiliar para obtener icono con el helper centralizado
         def obtener_icono_mejorado(ruta_archivo, es_carpeta=False):
-            """Obtiene el icono de un archivo con múltiples fallbacks"""
-            icono = None
-            file_info = QFileInfo(ruta_archivo)
-            
-            # Método 1: Para archivos .url, usar método especializado PRIMERO (prioridad alta)
-            if not es_carpeta:
-                try:
-                    suffix = Path(ruta_archivo).suffix.lower()
-                    if suffix == '.url':
-                        # Intentar obtener icono desde el contenido del archivo .url
-                        icono_url = obtener_icono_desde_url(ruta_archivo)
-                        if icono_url and not icono_url.isNull():
-                            pixmap_test = icono_url.pixmap(tamano_icono_alta_calidad)
-                            if not pixmap_test.isNull() and not pixmap_test.rect().isEmpty():
-                                if pixmap_test.width() > 0 and pixmap_test.height() > 0:
-                                    return icono_url
-                except Exception:
-                    pass
-            
-            # Método 2: Intentar obtener icono del sistema usando QFileIconProvider
-            try:
-                if es_carpeta:
-                    icono = icon_provider.icon(QFileIconProvider.Folder)
-                else:
-                    icono = icon_provider.icon(file_info)
-                
-                # Verificar que el icono sea válido (no esté vacío)
-                if icono and not icono.isNull():
-                    pixmap_test = icono.pixmap(tamano_icono_alta_calidad)
-                    if not pixmap_test.isNull() and not pixmap_test.rect().isEmpty():
-                        # Verificar que el pixmap tenga contenido real (no solo transparente)
-                        if pixmap_test.width() > 0 and pixmap_test.height() > 0:
-                            return icono
-            except Exception:
-                pass
-            
-            # Método 2b: Para archivos ejecutables y accesos directos, intentar múltiples veces
-            if not es_carpeta:
-                try:
-                    suffix = Path(ruta_archivo).suffix.lower()
-                    # Para ejecutables, intentar obtener el icono con diferentes métodos
-                    if suffix in ['.exe', '.lnk', '.ink', '.msi', '.bat', '.cmd']:
-                        # Intentar con el archivo directamente
-                        icono = icon_provider.icon(file_info)
-                        if icono and not icono.isNull():
-                            pixmap_test = icono.pixmap(tamano_icono_alta_calidad)
-                            if not pixmap_test.isNull() and not pixmap_test.rect().isEmpty():
-                                # Verificar que tenga contenido real
-                                if pixmap_test.width() > 0 and pixmap_test.height() > 0:
-                                    return icono
-                        
-                        # Si es un acceso directo (.lnk), intentar obtener el icono del destino
-                        if suffix == '.lnk':
-                            try:
-                                # QFileInfo debería resolver el destino del acceso directo
-                                icono = icon_provider.icon(file_info)
-                                if icono and not icono.isNull():
-                                    pixmap_test = icono.pixmap(tamano_icono_alta_calidad)
-                                    if not pixmap_test.isNull() and not pixmap_test.rect().isEmpty():
-                                        return icono
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-                
-                # Método 3: Intentar obtener icono del tipo de archivo específico
-                try:
-                    icono = icon_provider.icon(file_info)
-                    if icono and not icono.isNull():
-                        pixmap_test = icono.pixmap(tamano_icono_alta_calidad)
-                        if not pixmap_test.isNull() and not pixmap_test.rect().isEmpty():
-                            return icono
-                except Exception:
-                    pass
-                
-                # Método 4: Intentar usar el icono del tipo de archivo genérico
-                try:
-                    icono = icon_provider.icon(QFileIconProvider.File)
-                    if icono and not icono.isNull():
-                        pixmap_test = icono.pixmap(tamano_icono_alta_calidad)
-                        if not pixmap_test.isNull() and not pixmap_test.rect().isEmpty():
-                            return icono
-                except Exception:
-                    pass
-            
-            # Método 5: Fallback final - icono genérico
             if es_carpeta:
                 return icon_provider.icon(QFileIconProvider.Folder)
-            else:
-                return icon_provider.icon(QFileIconProvider.File)
-        
+            return get_file_icon(ruta_archivo, icon_provider)
+
         # Agregar a la lista con iconos reales
         for elemento in elementos_ordenados:
             if elemento.is_dir():
@@ -1947,7 +1732,83 @@ class CasillaVentana(QWidget):
                 QMessageBox.warning(self, "Error", f"No se pudo abrir el archivo:\n{str(e)}")
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"Error inesperado al abrir:\n{str(e)}")
-            
+
+    def mostrar_menu_contextual_archivo(self, punto):
+        item = self.lista_archivos.itemAt(punto)
+        if item is None:
+            return
+
+        menu = QMenu(self)
+        accion_abrir = menu.addAction("Abrir")
+        accion_renombrar = menu.addAction("Renombrar")
+        accion_eliminar = menu.addAction("Eliminar")
+
+        accion_abrir.triggered.connect(lambda: self.abrir_archivo(item))
+        accion_renombrar.triggered.connect(lambda: self.renombrar_archivo(item))
+        accion_eliminar.triggered.connect(lambda: self.eliminar_archivo(item))
+
+        menu.exec_(self.lista_archivos.mapToGlobal(punto))
+
+    def renombrar_archivo(self, item):
+        ruta_elemento = Path(item.data(Qt.UserRole))
+        if not ruta_elemento.exists():
+            QMessageBox.warning(self, "Error", "El archivo o carpeta ya no existe.")
+            self.actualizar_lista_archivos()
+            return
+
+        nuevo_nombre, aceptado = QInputDialog.getText(
+            self,
+            "Renombrar elemento",
+            "Nuevo nombre:",
+            text=ruta_elemento.name
+        )
+
+        if not aceptado:
+            return
+
+        nuevo_nombre = nuevo_nombre.strip()
+        if not nuevo_nombre:
+            QMessageBox.warning(self, "Nombre inválido", "Debes ingresar un nombre válido.")
+            return
+
+        nueva_ruta = ruta_elemento.with_name(nuevo_nombre)
+        if nueva_ruta.exists():
+            QMessageBox.warning(self, "Error", "Ya existe un archivo o carpeta con ese nombre.")
+            return
+
+        try:
+            ruta_elemento.rename(nueva_ruta)
+            self.actualizar_lista_archivos()
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"No se pudo renombrar:\n{str(e)}")
+
+    def eliminar_archivo(self, item):
+        ruta_elemento = Path(item.data(Qt.UserRole))
+        if not ruta_elemento.exists():
+            QMessageBox.warning(self, "Error", "El archivo o carpeta ya no existe.")
+            self.actualizar_lista_archivos()
+            return
+
+        tipo = "carpeta" if ruta_elemento.is_dir() else "archivo"
+        respuesta = QMessageBox.question(
+            self,
+            "Confirmar eliminación",
+            f"¿Eliminar {tipo} '{ruta_elemento.name}'?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if respuesta != QMessageBox.Yes:
+            return
+
+        try:
+            if ruta_elemento.is_dir():
+                shutil.rmtree(ruta_elemento)
+            else:
+                ruta_elemento.unlink()
+            self.actualizar_lista_archivos()
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"No se pudo eliminar:\n{str(e)}")
+
     def eliminar_casilla(self):
         """Elimina la casilla"""
         respuesta = QMessageBox.question(
@@ -2059,255 +1920,6 @@ class DialogCrearCasilla(QDialog):
             self.accept()
         else:
             QMessageBox.warning(self, "Advertencia", "Por favor ingresa un nombre para la casilla.")
-
-
-def obtener_ruta_fondo_escritorio():
-    """Obtiene la ruta del fondo de escritorio de Windows"""
-    try:
-        # Intentar obtener desde el registro de Windows
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Control Panel\Desktop"
-        )
-        
-        # Método 1: Intentar obtener "Wallpaper" (método tradicional)
-        try:
-            wallpaper_path, _ = winreg.QueryValueEx(key, "Wallpaper")
-            wallpaper_path = os.path.expandvars(wallpaper_path)
-            if wallpaper_path and os.path.exists(wallpaper_path):
-                winreg.CloseKey(key)
-                return wallpaper_path
-        except (OSError, FileNotFoundError, ValueError):
-            pass
-        
-        # Método 2: Intentar obtener "TranscodedWallpaper" (Windows 10/11)
-        try:
-            transcoded_path, _ = winreg.QueryValueEx(key, "TranscodedWallpaper")
-            transcoded_path = os.path.expandvars(transcoded_path)
-            if transcoded_path and os.path.exists(transcoded_path):
-                winreg.CloseKey(key)
-                return transcoded_path
-            
-            # Si TranscodedWallpaper existe pero la ruta no, buscar en ubicaciones comunes
-            if transcoded_path:
-                nombre_archivo = os.path.basename(transcoded_path)
-                # Buscar en Themes
-                temas_path = Path(os.environ.get('APPDATA', '')) / "Microsoft" / "Windows" / "Themes"
-                transcoded_file = temas_path / nombre_archivo
-                if transcoded_file.exists():
-                    winreg.CloseKey(key)
-                    return str(transcoded_file)
-                # Buscar el archivo TranscodedWallpaper directamente
-                transcoded_wallpaper = temas_path / "TranscodedWallpaper"
-                if transcoded_wallpaper.exists():
-                    winreg.CloseKey(key)
-                    return str(transcoded_wallpaper)
-        except (OSError, FileNotFoundError, ValueError):
-            pass
-        
-        # Método 3: Si Wallpaper existe pero la ruta no, buscar en ubicaciones alternativas
-        try:
-            wallpaper_path, _ = winreg.QueryValueEx(key, "Wallpaper")
-            wallpaper_path = os.path.expandvars(wallpaper_path)
-            
-            if wallpaper_path:
-                # Extraer solo el nombre del archivo
-                nombre_archivo = os.path.basename(wallpaper_path)
-                
-                # Buscar en AppData\Roaming\Microsoft\Windows\Themes
-                appdata_path = Path(os.environ.get('APPDATA', '')) / "Microsoft" / "Windows" / "Themes" / nombre_archivo
-                if appdata_path.exists():
-                    winreg.CloseKey(key)
-                    return str(appdata_path)
-                
-                # Buscar en la carpeta de Windows
-                windows_path = Path(os.environ.get('WINDIR', '')) / "Web" / "Wallpaper" / nombre_archivo
-                if windows_path.exists():
-                    winreg.CloseKey(key)
-                    return str(windows_path)
-                
-                # Buscar en subcarpetas de Windows\Web\Wallpaper
-                wallpaper_base = Path(os.environ.get('WINDIR', '')) / "Web" / "Wallpaper"
-                if wallpaper_base.exists():
-                    for subfolder in wallpaper_base.iterdir():
-                        if subfolder.is_dir():
-                            potential_path = subfolder / nombre_archivo
-                            if potential_path.exists():
-                                winreg.CloseKey(key)
-                                return str(potential_path)
-        except (OSError, FileNotFoundError, ValueError):
-            pass
-        
-        winreg.CloseKey(key)
-        
-    except (OSError, FileNotFoundError, PermissionError):
-        # Si no se puede acceder al registro, intentar métodos alternativos
-        pass
-    except Exception:
-        pass
-    
-    # Método 4: Buscar directamente en la carpeta de temas de Windows
-    try:
-        temas_path = Path(os.environ.get('APPDATA', '')) / "Microsoft" / "Windows" / "Themes"
-        if temas_path.exists():
-            # Buscar TranscodedWallpaper primero (más común en Windows 10/11)
-            transcoded_wallpaper = temas_path / "TranscodedWallpaper"
-            if transcoded_wallpaper.exists() and transcoded_wallpaper.is_file():
-                return str(transcoded_wallpaper)
-            
-            # Buscar archivos de imagen comunes
-            extensiones = ['.jpg', '.jpeg', '.png', '.bmp', '.jfif']
-            for ext in extensiones:
-                for archivo in temas_path.glob(f'*{ext}'):
-                    if archivo.is_file() and archivo.stat().st_size > 0:  # Verificar que no esté vacío
-                        return str(archivo)
-    except Exception:
-        pass
-    
-    # Método 5: Buscar en las carpetas de fondos de Windows
-    try:
-        wallpaper_base = Path(os.environ.get('WINDIR', '')) / "Web" / "Wallpaper"
-        if wallpaper_base.exists():
-            # Buscar en subcarpetas
-            for subfolder in wallpaper_base.iterdir():
-                if subfolder.is_dir():
-                    extensiones = ['.jpg', '.jpeg', '.png', '.bmp', '.jfif']
-                    for ext in extensiones:
-                        for archivo in subfolder.glob(f'*{ext}'):
-                            if archivo.is_file() and archivo.stat().st_size > 0:
-                                return str(archivo)
-    except Exception:
-        pass
-        
-    except (OSError, FileNotFoundError, PermissionError) as e:
-        print(f"Error al acceder al registro de Windows: {e}")
-    except Exception as e:
-        print(f"Error inesperado al obtener fondo de escritorio: {e}")
-    
-    return None
-
-
-def analizar_colores_imagen(ruta_imagen, num_colores=5):
-    """Analiza una imagen y extrae los colores dominantes"""
-    try:
-        imagen = QImage(ruta_imagen)
-        if imagen.isNull():
-            return None
-        
-        # Redimensionar para análisis más rápido (máximo 200x200)
-        if imagen.width() > 200 or imagen.height() > 200:
-            imagen = imagen.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        
-        # Obtener colores de píxeles (muestrear cada 5 píxeles para velocidad)
-        colores = []
-        for y in range(0, imagen.height(), 5):
-            for x in range(0, imagen.width(), 5):
-                pixel = imagen.pixel(x, y)
-                color = QColor(pixel)
-                # Ignorar colores muy claros o muy oscuros (probablemente no son dominantes)
-                if 30 < color.lightness() < 225:
-                    colores.append((color.red(), color.green(), color.blue()))
-        
-        if not colores:
-            return None
-        
-        # Encontrar colores más frecuentes
-        contador = Counter(colores)
-        colores_dominantes = contador.most_common(num_colores)
-        
-        # Convertir a lista de tuplas RGB
-        return [color[0] for color in colores_dominantes]
-    except Exception as e:
-        print(f"Error al analizar imagen: {e}")
-        return None
-
-
-def generar_paleta_colores(colores_dominantes):
-    """Genera una paleta de colores para las casillas basada en colores dominantes"""
-    if not colores_dominantes or len(colores_dominantes) == 0:
-        # Colores por defecto si no se pueden detectar
-        return {
-            "fondo": (100, 150, 200, 140),
-            "borde": (50, 100, 150, 220),
-            "boton_expandir": (70, 110, 150, 200),
-            "texto": (255, 255, 255, 255),
-            "lista_fondo": (60, 100, 140, 120),
-            "lista_borde": (80, 120, 160, 180)
-        }
-    
-    # Usar el color más dominante como base
-    color_base = colores_dominantes[0]
-    r_base, g_base, b_base = color_base
-    
-    # Calcular luminosidad para determinar si usar texto claro u oscuro
-    luminosidad = (r_base * 0.299 + g_base * 0.587 + b_base * 0.114)
-    
-    # Ajustar el color base para mejor visibilidad
-    # Si es muy oscuro, aclararlo un poco; si es muy claro, oscurecerlo un poco
-    if luminosidad < 50:
-        # Muy oscuro, aclarar un poco
-        r_base = min(255, int(r_base * 1.3))
-        g_base = min(255, int(g_base * 1.3))
-        b_base = min(255, int(b_base * 1.3))
-    elif luminosidad > 200:
-        # Muy claro, oscurecer un poco
-        r_base = max(0, int(r_base * 0.7))
-        g_base = max(0, int(g_base * 0.7))
-        b_base = max(0, int(b_base * 0.7))
-    
-    # Recalcular luminosidad después del ajuste
-    luminosidad = (r_base * 0.299 + g_base * 0.587 + b_base * 0.114)
-    
-    # Generar colores de la paleta con mejor contraste
-    # Fondo: color base con transparencia media (ajustada según luminosidad)
-    if luminosidad < 100:
-        # Fondo oscuro, usar más transparencia
-        a_fondo = 160
-    elif luminosidad > 180:
-        # Fondo claro, usar menos transparencia para mejor visibilidad
-        a_fondo = 180
-    else:
-        a_fondo = 140
-    fondo = (r_base, g_base, b_base, a_fondo)
-    
-    # Borde: color base más oscuro pero con buen contraste
-    r_borde = max(0, min(255, int(r_base * 0.65)))
-    g_borde = max(0, min(255, int(g_base * 0.65)))
-    b_borde = max(0, min(255, int(b_base * 0.65)))
-    borde = (r_borde, g_borde, b_borde, 220)
-    
-    # Botón: color base ligeramente más oscuro
-    r_boton = max(0, min(255, int(r_base * 0.75)))
-    g_boton = max(0, min(255, int(g_base * 0.75)))
-    b_boton = max(0, min(255, int(b_base * 0.75)))
-    boton_expandir = (r_boton, g_boton, b_boton, 200)
-    
-    # Texto: blanco si el fondo es oscuro, negro si es claro
-    if luminosidad < 120:
-        texto = (255, 255, 255, 255)
-    else:
-        texto = (30, 30, 30, 255)
-    
-    # Lista fondo: color base más oscuro y transparente
-    r_lista = max(0, min(255, int(r_base * 0.55)))
-    g_lista = max(0, min(255, int(g_base * 0.55)))
-    b_lista = max(0, min(255, int(b_base * 0.55)))
-    lista_fondo = (r_lista, g_lista, b_lista, 120)
-    
-    # Lista borde: color base medio
-    r_lista_borde = max(0, min(255, int(r_base * 0.7)))
-    g_lista_borde = max(0, min(255, int(g_base * 0.7)))
-    b_lista_borde = max(0, min(255, int(b_base * 0.7)))
-    lista_borde = (r_lista_borde, g_lista_borde, b_lista_borde, 180)
-    
-    return {
-        "fondo": fondo,
-        "borde": borde,
-        "boton_expandir": boton_expandir,
-        "texto": texto,
-        "lista_fondo": lista_fondo,
-        "lista_borde": lista_borde
-    }
 
 
 class DialogConfigurarColores(QDialog):
@@ -2474,7 +2086,7 @@ class DialogConfigurarColores(QDialog):
     def detectar_colores_automatico(self):
         """Detecta automáticamente los colores del fondo de escritorio"""
         # Obtener ruta del fondo
-        ruta_fondo = obtener_ruta_fondo_escritorio()
+        ruta_fondo = get_wallpaper_path()
         
         if not ruta_fondo:
             QMessageBox.warning(
@@ -2491,7 +2103,7 @@ class DialogConfigurarColores(QDialog):
             return
         
         # Analizar colores
-        colores_dominantes = analizar_colores_imagen(ruta_fondo)
+        colores_dominantes = analyze_image_colors(ruta_fondo)
         
         if not colores_dominantes:
             QMessageBox.warning(
@@ -2503,7 +2115,7 @@ class DialogConfigurarColores(QDialog):
             return
         
         # Generar paleta
-        paleta = generar_paleta_colores(colores_dominantes)
+        paleta = generate_color_palette(colores_dominantes)
         
         # Actualizar colores seleccionados
         self.colores_seleccionados = paleta.copy()
@@ -4104,15 +3716,15 @@ class OrganizadorEscritorio:
     
     def detectar_colores_inicio(self):
         """Detecta automáticamente los colores del fondo al iniciar la aplicación"""
-        ruta_fondo = obtener_ruta_fondo_escritorio()
+        ruta_fondo = get_wallpaper_path()
         if not ruta_fondo:
             return
         
-        colores_dominantes = analizar_colores_imagen(ruta_fondo)
+        colores_dominantes = analyze_image_colors(ruta_fondo)
         if not colores_dominantes:
             return
         
-        paleta = generar_paleta_colores(colores_dominantes)
+        paleta = generate_color_palette(colores_dominantes)
         if paleta:
             # Guardar y aplicar sin mostrar mensajes
             self.guardar_colores(paleta)
